@@ -1,0 +1,13 @@
+[Unit]
+Description=Monitor network changes and reconnect WireGuard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wireguard-monitor
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+#!/bin/bash
+# Bounce all active WireGuard interfaces to restore connectivity
+
+for iface in $(ip link show type wireguard 2>/dev/null | awk -F'[ :]' '/^[0-9]/ {print $3}'); do
+    if [ -f "/etc/wireguard/${iface}.conf" ]; then
+        logger -t wireguard-reconnect "Bouncing $iface"
+        wg-quick down "$iface" 2>/dev/null
+        wg-quick up "$iface"
+    fi
+done

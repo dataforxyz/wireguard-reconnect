@@ -1,0 +1,19 @@
+#!/bin/bash
+# Monitor network route changes and bounce WireGuard when the default route changes.
+# This catches WiFi reconnects and network switches.
+
+DEBOUNCE=5
+LAST_BOUNCE=0
+
+while read -r line; do
+    case "$line" in
+        *"default via"*"dev wlan"*)
+            NOW=$(date +%s)
+            if (( NOW - LAST_BOUNCE >= DEBOUNCE )); then
+                LAST_BOUNCE=$NOW
+                sleep 2  # let the network stabilize
+                /usr/local/bin/wireguard-reconnect
+            fi
+            ;;
+    esac
+done < <(ip monitor route)

@@ -1,0 +1,9 @@
+#!/bin/bash
+# Bounce WireGuard after suspend/hibernate wake
+
+case "$1" in
+    post)
+        sleep 3  # let WiFi reconnect first
+        /usr/local/bin/wireguard-reconnect
+        ;;
+esac
