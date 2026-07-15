@@ -12,6 +12,7 @@
 
 set -u
 
+VERSION_FILE="${WIREGUARD_RECONNECT_VERSION_FILE:-/usr/local/share/wireguard-reconnect/VERSION}"
 LOG_FILE="/run/wireguard-reconnect.log"
 FAILURE_STATE="/run/wireguard-reconnect.failure"
 LOCK_FILE="/run/wireguard-reconnect.lock"
@@ -26,6 +27,25 @@ TAILSCALE_OPERATOR="${TAILSCALE_OPERATOR:-dxyz}"
 ACTION="${1:-}"
 IFACE="${2:-wg0}"
 WG_CONF="/etc/wireguard/${IFACE}.conf"
+
+print_version() {
+    local fallback
+    fallback="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/VERSION"
+    if [ -r "$VERSION_FILE" ]; then
+        printf 'wireguard-reconnect %s\n' "$(head -n 1 "$VERSION_FILE")"
+    elif [ -r "$fallback" ]; then
+        printf 'wireguard-reconnect %s\n' "$(head -n 1 "$fallback")"
+    else
+        printf 'wireguard-reconnect unknown\n'
+    fi
+}
+
+case "$ACTION" in
+    --version|-V|version)
+        print_version
+        exit 0
+        ;;
+esac
 
 # Reject anything that is not a plain wgN name so a caller cannot point us at
 # an attacker-controlled config (wg-quick configs can contain PostUp scripts).

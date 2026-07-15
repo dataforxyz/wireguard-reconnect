@@ -7,6 +7,11 @@ if [ "${EUID:-$(id -u)}" -ne 0 ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_VERSION="$(head -n 1 "$SCRIPT_DIR/VERSION")"
+if ! [[ "$PROJECT_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z.-]+)?$ ]]; then
+    echo "Invalid semantic version in $SCRIPT_DIR/VERSION: $PROJECT_VERSION" >&2
+    exit 1
+fi
 TARGET_USER="${INSTALL_USER:-${SUDO_USER:-}}"
 if [ -z "$TARGET_USER" ] || [ "$TARGET_USER" = "root" ]; then
     TARGET_USER="$(logname 2>/dev/null || true)"
@@ -42,6 +47,7 @@ backup_if_present /usr/local/bin/wireguard-reconnect
 backup_if_present /usr/local/bin/wireguard-monitor
 backup_if_present /usr/local/bin/wireguard-autostart
 backup_if_present /usr/local/bin/wg-killswitch
+backup_if_present /usr/local/share/wireguard-reconnect/VERSION
 backup_if_present /usr/lib/systemd/system-sleep/wireguard-reconnect
 backup_if_present /etc/systemd/system/wireguard-monitor.service
 backup_if_present /etc/systemd/system/wireguard-autostart.service
@@ -49,7 +55,8 @@ backup_if_present /etc/systemd/system/wireguard-killswitch.service
 backup_if_present /etc/polkit-1/rules.d/49-wireguard-reconnect.rules
 backup_if_present "$TARGET_HOME/.local/bin/wireguard-status"
 
-echo "Installing WireGuard reconnect components..."
+echo "Installing WireGuard reconnect v${PROJECT_VERSION} components..."
+install -Dm644 "$SCRIPT_DIR/VERSION" /usr/local/share/wireguard-reconnect/VERSION
 install -Dm755 "$SCRIPT_DIR/wireguard-reconnect" /usr/local/bin/wireguard-reconnect
 install -Dm755 "$SCRIPT_DIR/wireguard-monitor" /usr/local/bin/wireguard-monitor
 install -Dm755 "$SCRIPT_DIR/wireguard-autostart" /usr/local/bin/wireguard-autostart
@@ -96,7 +103,8 @@ systemctl restart wireguard-autostart.service
 pkill -RTMIN+10 -u "$TARGET_USER" waybar 2>/dev/null || true
 
 echo
-echo "Installed successfully. WireGuard is now enabled by default on every boot."
+echo "Installed wireguard-reconnect v${PROJECT_VERSION} successfully."
+echo "WireGuard is now enabled by default on every boot."
 echo "Backup of replaced files: $BACKUP_DIR"
 echo
 systemctl status wireguard-killswitch.service wireguard-monitor.service wireguard-autostart.service --no-pager

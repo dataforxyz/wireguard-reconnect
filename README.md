@@ -3,6 +3,8 @@
 Event-driven WireGuard recovery for a Linux laptop using iwd/systemd-networkd,
 with Waybar controls, a full-tunnel kill switch, and Tailscale route repair.
 
+Current release: **v1.0.0**
+
 ## Behavior
 
 - **Before normal networking at boot:** pre-arms a fail-closed nftables guard
@@ -59,6 +61,33 @@ The installer:
 The Waybar module should execute `wireguard-status`, left-click
 `wireguard-status toggle`, and right-click `wireguard-status disconnect`.
 
+Check the installed version with:
+
+```bash
+wireguard-reconnect --version
+```
+
+## Versioning and releases
+
+The project follows [Semantic Versioning](https://semver.org/):
+
+- **MAJOR** for incompatible behavior or installation changes
+- **MINOR** for backward-compatible features
+- **PATCH** for backward-compatible fixes
+
+`VERSION` is the source of truth for the current release. Release commits are
+tagged as `vMAJOR.MINOR.PATCH`, and notable changes are recorded in
+[`CHANGELOG.md`](CHANGELOG.md).
+
+Release checklist:
+
+1. update `VERSION`;
+2. move release notes into `CHANGELOG.md` with the release date;
+3. update the current release shown in this README;
+4. run the test and static-validation commands;
+5. commit, create an annotated `vX.Y.Z` tag, and push the commit and tag to both
+   GitHub and FGit.
+
 ## Configuration overrides
 
 Environment variables may be supplied through systemd service drop-ins:
@@ -87,9 +116,12 @@ Run the unprivileged nftables-generation regression test with:
 
 ```bash
 ./tests/test-killswitch.sh
+./tests/test-version.sh
 ```
 
-It verifies policy-drop output/forward chains, the endpoint-only public
+The version test ensures `VERSION`, `CHANGELOG.md`, the README release label,
+and `wireguard-reconnect --version` remain consistent. The kill-switch test
+verifies policy-drop output/forward chains, the endpoint-only public
 exception, unresolved-endpoint behavior, and fallback to a smaller emergency
 guard when the full nftables ruleset is rejected. Failure cases leave a
 blocking guard installed while returning non-zero so WireGuard stays down.
