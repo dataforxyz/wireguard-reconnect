@@ -198,7 +198,13 @@ fi
 
 case "$ACTION" in
     up)
-        if ! wg_quick_up >>"$LOG_FILE" 2>&1; then
+        # Another serialized boot/monitor request may have created the interface
+        # after the caller decided it was missing. Treat that race as an
+        # idempotent success instead of running a stale `wg-quick up` and
+        # reporting a false critical failure.
+        if ip link show "$IFACE" >/dev/null 2>&1; then
+            echo "[#] $IFACE is already present; skipping duplicate up" >>"$LOG_FILE"
+        elif ! wg_quick_up >>"$LOG_FILE" 2>&1; then
             critical "wg-quick up $IFACE failed; kill switch remains active"
             exit 1
         fi

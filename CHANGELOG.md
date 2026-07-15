@@ -3,6 +3,17 @@
 All notable changes to this project are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.1] - 2026-07-15
+
+### Fixed
+
+- Made boot-time `up` requests idempotent when the monitor and autostart service
+  both observe a missing interface before either serialized request completes.
+- Avoided an unnecessary second WireGuard bounce when autostart finds that the
+  event monitor has already created `wg0`.
+- Eliminated the resulting false critical `wg-quick up wg0 failed` journal entry
+  seen during the first hardened installation.
+
 ## [1.0.0] - 2026-07-15
 
 ### Added
@@ -26,4 +37,5 @@ All notable changes to this project are documented here. The project follows
 - Critical failures are recorded in `/run/wireguard-reconnect.failure` and
   surfaced in the Waybar tooltip.
 
+[1.0.1]: https://github.com/dataforxyz/wireguard-reconnect/releases/tag/v1.0.1
 [1.0.0]: https://github.com/dataforxyz/wireguard-reconnect/releases/tag/v1.0.0

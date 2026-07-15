@@ -27,12 +27,14 @@ chmod 0644 "$INTENT_STATE" 2>/dev/null || true
 for ((attempt = 0; attempt <= STARTUP_WAIT; attempt++)); do
     if underlay_online; then
         if ip link show "$IFACE" >/dev/null 2>&1; then
-            log "Physical network ready; checking existing $IFACE"
-            "$RECONNECT_HELPER" reconnect "$IFACE"
-        else
-            log "Physical network ready; enabling $IFACE by default"
-            "$RECONNECT_HELPER" up "$IFACE"
+            # The event monitor or another boot unit already handled startup.
+            # Avoid an unnecessary second bounce; ongoing health checks repair
+            # the interface if it is stale.
+            log "$IFACE is already present; startup connection is satisfied"
+            exit 0
         fi
+        log "Physical network ready; enabling $IFACE by default"
+        "$RECONNECT_HELPER" up "$IFACE"
         exit $?
     fi
     sleep 1

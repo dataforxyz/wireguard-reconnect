@@ -3,7 +3,7 @@
 Event-driven WireGuard recovery for a Linux laptop using iwd/systemd-networkd,
 with Waybar controls, a full-tunnel kill switch, and Tailscale route repair.
 
-Current release: **v1.0.0**
+Current release: **v1.0.1**
 
 ## Behavior
 
@@ -116,11 +116,14 @@ Run the unprivileged nftables-generation regression test with:
 
 ```bash
 ./tests/test-killswitch.sh
+./tests/test-autostart.sh
 ./tests/test-version.sh
 ```
 
-The version test ensures `VERSION`, `CHANGELOG.md`, the README release label,
-and `wireguard-reconnect --version` remain consistent. The kill-switch test
+The autostart test verifies that startup is idempotent when another boot
+component has already created `wg0`. The version test ensures `VERSION`,
+`CHANGELOG.md`, the README release label, and `wireguard-reconnect --version`
+remain consistent. The kill-switch test
 verifies policy-drop output/forward chains, the endpoint-only public
 exception, unresolved-endpoint behavior, and fallback to a smaller emergency
 guard when the full nftables ruleset is rejected. Failure cases leave a
