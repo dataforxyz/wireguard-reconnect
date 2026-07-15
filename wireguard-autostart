@@ -1,0 +1,44 @@
+#!/bin/bash
+# Mark WireGuard as intended-on on every boot and connect it as soon as the
+# physical network has a default route. The network monitor handles a late Wi-Fi
+# connection if no underlay is ready when this unit first runs.
+
+set -u
+
+IFACE="${WIREGUARD_INTERFACE:-wg0}"
+INTENT_STATE="${WIREGUARD_INTENT_STATE:-/run/wireguard-reconnect.enabled}"
+RECONNECT_HELPER="${WIREGUARD_RECONNECT_HELPER:-/usr/local/bin/wireguard-reconnect}"
+STARTUP_WAIT="${WIREGUARD_STARTUP_WAIT:-30}"
+
+log() {
+    logger -t wireguard-autostart "$*" 2>/dev/null || true
+    printf 'wireguard-autostart: %s\n' "$*" >&2
+}
+
+underlay_online() {
+    ip -4 route show table main default 2>/dev/null | \
+        awk '$0 !~ / dev (wg[0-9]*|tailscale[0-9]*|tun[0-9]*|tap[0-9]*)/ { found=1 } END { exit !found }'
+}
+
+install -d -m 0755 "$(dirname "$INTENT_STATE")"
+printf '%s\n' "$IFACE" >"$INTENT_STATE"
+chmod 0644 "$INTENT_STATE" 2>/dev/null || true
+
+for ((attempt = 0; attempt <= STARTUP_WAIT; attempt++)); do
+    if underlay_online; then
+        if ip link show "$IFACE" >/dev/null 2>&1; then
+            log "Physical network ready; checking existing $IFACE"
+            "$RECONNECT_HELPER" reconnect "$IFACE"
+        else
+            log "Physical network ready; enabling $IFACE by default"
+            "$RECONNECT_HELPER" up "$IFACE"
+        fi
+        exit $?
+    fi
+    sleep 1
+done
+
+# Keep the intent marker. wireguard-monitor will connect on the next physical
+# route/address event instead of failing the boot because Wi-Fi was late.
+log "No physical default route after ${STARTUP_WAIT}s; waiting for network monitor"
+exit 0

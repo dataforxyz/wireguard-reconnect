@@ -1,19 +1,141 @@
 #!/bin/bash
-# Monitor network route changes and bounce WireGuard when the default route changes.
-# This catches WiFi reconnects and network switches.
+# Event-driven WireGuard repair for iwd/systemd-networkd laptops.
+#
+# The process watches physical route/link/address changes. It waits for the
+# underlay to settle, verifies real traffic through WireGuard, and only bounces
+# the tunnel when it is intended-on and actually stale.
 
-DEBOUNCE=5
-LAST_BOUNCE=0
+set -u
 
-while read -r line; do
-    case "$line" in
-        *"default via"*"dev wlan"*)
-            NOW=$(date +%s)
-            if (( NOW - LAST_BOUNCE >= DEBOUNCE )); then
-                LAST_BOUNCE=$NOW
-                sleep 2  # let the network stabilize
-                /usr/local/bin/wireguard-reconnect
+IFACE="${WIREGUARD_INTERFACE:-wg0}"
+DEBOUNCE="${WIREGUARD_MONITOR_DEBOUNCE:-5}"
+STABILIZE_DELAY="${WIREGUARD_MONITOR_STABILIZE_DELAY:-2}"
+CHECK_URL="${WIREGUARD_CHECK_URL:-http://connectivitycheck.gstatic.com/generate_204}"
+CHECK_ROUTE_IP="${WIREGUARD_CHECK_ROUTE_IP:-9.9.9.9}"
+CHECK_TIMEOUT="${WIREGUARD_CHECK_TIMEOUT:-4}"
+INTENT_STATE="${WIREGUARD_INTENT_STATE:-/run/wireguard-reconnect.enabled}"
+KILLSWITCH_STATE="${WIREGUARD_KILLSWITCH_STATE:-/run/wg-killswitch.enabled}"
+RECONNECT_HELPER="${WIREGUARD_RECONNECT_HELPER:-/usr/local/bin/wireguard-reconnect}"
+KILLSWITCH_HELPER="${WIREGUARD_KILLSWITCH_HELPER:-/usr/local/bin/wg-killswitch}"
+FAILURE_STATE="${WIREGUARD_FAILURE_STATE:-/run/wireguard-reconnect.failure}"
+ACTION_LOCK="${WIREGUARD_MONITOR_LOCK:-/run/wireguard-monitor-action.lock}"
+RECONNECT_LOCK="${WIREGUARD_RECONNECT_LOCK:-/run/wireguard-reconnect.lock}"
+GUARD_CHECK_INTERVAL="${WIREGUARD_GUARD_CHECK_INTERVAL:-15}"
+LAST_TRIGGER=0
+
+log() {
+    logger -t wireguard-monitor "$*" 2>/dev/null || true
+    printf 'wireguard-monitor: %s\n' "$*" >&2
+}
+
+vpn_intended_on() {
+    [ -f "$INTENT_STATE" ] || [ -f "$KILLSWITCH_STATE" ] || ip link show "$IFACE" >/dev/null 2>&1
+}
+
+underlay_online() {
+    ip -4 route show table main default 2>/dev/null | \
+        awk '$0 !~ / dev (wg[0-9]*|tailscale[0-9]*|tun[0-9]*|tap[0-9]*)/ { found=1 } END { exit !found }'
+}
+
+vpn_online() {
+    local code
+    ip link show "$IFACE" >/dev/null 2>&1 || return 1
+    ip -4 route get "$CHECK_ROUTE_IP" 2>/dev/null | grep -q " dev ${IFACE}\\b" || return 1
+    code="$(curl --interface "$IFACE" --silent --show-error --max-time "$CHECK_TIMEOUT" \
+        --output /dev/null --write-out '%{http_code}' "$CHECK_URL" 2>/dev/null || true)"
+    [ "$code" = "204" ] || [ "$code" = "200" ]
+}
+
+repair_if_needed() {
+    local reason="${1:-network event}" action
+
+    exec 9>"$ACTION_LOCK"
+    flock -n 9 || return 0
+
+    vpn_intended_on || return 0
+    underlay_online || return 0
+
+    sleep "$STABILIZE_DELAY"
+    underlay_online || return 0
+
+    if vpn_online; then
+        log "$reason: $IFACE is already online"
+        return 0
+    fi
+
+    if ip link show "$IFACE" >/dev/null 2>&1; then
+        action=reconnect
+    else
+        action=up
+    fi
+
+    log "$reason: $IFACE is stale or missing; running $action"
+    if "$RECONNECT_HELPER" "$action" "$IFACE"; then
+        log "$reason: $IFACE $action completed"
+    else
+        log "$reason: $IFACE $action failed; a later network event will retry"
+        return 1
+    fi
+}
+
+trigger_repair() {
+    local now reason="${1:-network event}"
+    now="$(date +%s)"
+    if (( now - LAST_TRIGGER < DEBOUNCE )); then
+        return 0
+    fi
+    LAST_TRIGGER="$now"
+    repair_if_needed "$reason" &
+}
+
+guard_watchdog() {
+    while sleep "$GUARD_CHECK_INTERVAL"; do
+        vpn_intended_on || continue
+        [ -x "$KILLSWITCH_HELPER" ] || continue
+
+        # Use a subshell so the lock fd is always closed after this check.
+        # Sharing the privileged helper's lock prevents re-arming the guard in
+        # the middle of an intentional disconnect.
+        (
+            local message
+            exec 8>"$RECONNECT_LOCK"
+            flock -n 8 || exit 0
+
+            if "$KILLSWITCH_HELPER" status >/dev/null 2>&1; then
+                exit 0
             fi
+
+            log "CRITICAL: kill-switch verification failed; attempting immediate repair"
+            if /usr/bin/timeout 15s "$KILLSWITCH_HELPER" enable "$IFACE" >/dev/null 2>&1 && \
+                "$KILLSWITCH_HELPER" status >/dev/null 2>&1; then
+                log "kill-switch watchdog restored verified protection"
+                if [ -r "$FAILURE_STATE" ] && grep -q '^Kill-switch watchdog:' "$FAILURE_STATE"; then
+                    rm -f "$FAILURE_STATE"
+                fi
+            else
+                message="Kill-switch watchdog: protection could not be verified; inspect immediately (normal and emergency guard repair failed or is incomplete)"
+                printf '%s\n' "$message" >"$FAILURE_STATE"
+                chmod 0644 "$FAILURE_STATE" 2>/dev/null || true
+                logger -p daemon.crit -t wireguard-monitor "$message" 2>/dev/null || true
+            fi
+        )
+    done
+}
+
+# A service restart after resume gets an immediate health check even if the
+# relevant netlink event happened just before the monitor started reading.
+trigger_repair "monitor start/resume"
+guard_watchdog &
+WATCHDOG_PID=$!
+trap 'kill "$WATCHDOG_PID" 2>/dev/null || true' EXIT INT TERM
+
+ip monitor route link address | while IFS= read -r line; do
+    case "$line" in
+        *" dev wg"*|*"wg0:"*|*"tailscale"*|*"docker"*|*"veth"*|*"br-"*|*"virbr"*)
+            continue
+            ;;
+        *"default via "*|*"wlan"*|*" wl"*|*"enp"*|*" eth"*)
+            trigger_repair "physical network change"
             ;;
     esac
-done < <(ip monitor route)
+done

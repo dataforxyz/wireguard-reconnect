@@ -1,0 +1,393 @@
+#!/bin/bash
+# WireGuard status script for Waybar
+#
+# The icon is green only when traffic actually works through WireGuard.  An
+# interface that exists but cannot pass a connectivity check is shown as stale,
+# which is what happens after some sleep/wake and captive-portal transitions.
+
+INTERFACE="${WIREGUARD_INTERFACE:-wg0}"
+WAYBAR_SIGNAL="${WAYBAR_WIREGUARD_SIGNAL:-RTMIN+10}"
+# The privileged helper (run as root via pkexec) owns and writes this file; we
+# only read it for tooltips/error messages.
+LOG_FILE="/run/wireguard-reconnect.log"
+FAILURE_STATE="/run/wireguard-reconnect.failure"
+RECONNECT_HELPER="${WIREGUARD_RECONNECT_HELPER:-/usr/local/bin/wireguard-reconnect}"
+# Self-heal: when the interface is up but offline, attempt a hands-free
+# reconnect straight from the Waybar poll instead of waiting for a manual click.
+AUTORECONNECT="${WIREGUARD_AUTORECONNECT:-1}"
+AUTORECONNECT_COOLDOWN="${WIREGUARD_AUTORECONNECT_COOLDOWN:-120}"
+AUTORECONNECT_STALE_THRESHOLD="${WIREGUARD_AUTORECONNECT_STALE_THRESHOLD:-4}"
+# Waybar polls this script every ~10s. A gap much larger than that between two
+# polls means the machine was suspended/frozen (or Waybar was paused), so the
+# consecutive-stale debounce no longer applies: the last network state we saw is
+# ancient. On such a gap, skip straight to a reconnect attempt instead of
+# waiting for AUTORECONNECT_STALE_THRESHOLD fresh failures (~40s).
+AUTORECONNECT_GAP_THRESHOLD="${WIREGUARD_AUTORECONNECT_GAP_THRESHOLD:-45}"
+CHECK_URL="${WIREGUARD_CHECK_URL:-http://connectivitycheck.gstatic.com/generate_204}"
+# Full-tunnel WireGuard is considered online only when normal routing sends
+# internet traffic through the WG interface.  After sleep, systemd-networkd can
+# leave wg0 up while deleting wg-quick's policy rules; a forced
+# `curl --interface wg0` still succeeds in that state, so also verify routing.
+CHECK_ROUTE_IP="${WIREGUARD_CHECK_ROUTE_IP:-9.9.9.9}"
+CHECK_TIMEOUT="${WIREGUARD_CHECK_TIMEOUT:-4}"
+WAKE_ATTEMPTS="${WIREGUARD_WAKE_ATTEMPTS:-60}"
+WAKE_INTERVAL="${WIREGUARD_WAKE_INTERVAL:-10}"
+
+active_interface() {
+    if ip link show "$INTERFACE" &>/dev/null; then
+        printf '%s\n' "$INTERFACE"
+        return 0
+    fi
+
+    # If WireGuard was started manually under another interface name, still
+    # report it instead of claiming disconnected.
+    local iface
+    iface="$(wg show interfaces 2>/dev/null | awk '{print $1; exit}')"
+    if [ -n "$iface" ]; then
+        printf '%s\n' "$iface"
+        return 0
+    fi
+
+    return 1
+}
+
+iface_online() {
+    local iface="$1" code
+
+    code="$(curl --interface "$iface" --silent --show-error --max-time "$CHECK_TIMEOUT" \
+        --output /dev/null --write-out '%{http_code}' "$CHECK_URL" 2>/dev/null || true)"
+
+    # Google's endpoint returns 204.  Accept 200 too for custom check URLs.
+    [ "$code" = "204" ] || [ "$code" = "200" ]
+}
+
+route_uses_iface() {
+    local iface="$1"
+    ip -4 route get "$CHECK_ROUTE_IP" 2>/dev/null | grep -q " dev ${iface}\b"
+}
+
+vpn_online() {
+    local iface="$1"
+    route_uses_iface "$iface" && iface_online "$iface"
+}
+
+physical_interfaces() {
+    ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | \
+        grep -Ev '^(lo|wg[0-9]*|tailscale[0-9]*|docker[0-9]*|br-|veth|tun|tap|virbr|zt|nebula)' || true
+}
+
+kill_switch_intended_on() {
+    [ -f /run/wg-killswitch.enabled ]
+}
+
+underlay_online() {
+    local iface
+
+    # When the nft kill switch is enabled, direct public probes over wlan0 are
+    # supposed to fail. Do not wait for `curl --interface wlan0` in that state;
+    # if a physical link has carrier/address/default route, let the privileged
+    # reconnect helper bootstrap WireGuard using its cached endpoint exception.
+    if kill_switch_intended_on; then
+        while IFS= read -r iface; do
+            [ -n "$iface" ] || continue
+            ip -4 route show default dev "$iface" 2>/dev/null | grep -q . && return 0
+            ip -4 addr show dev "$iface" scope global 2>/dev/null | grep -q 'inet ' && return 0
+        done < <(physical_interfaces)
+        return 1
+    fi
+
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
+        if iface_online "$iface"; then
+            return 0
+        fi
+    done < <(physical_interfaces)
+    return 1
+}
+
+refresh_waybar() {
+    pkill "-$WAYBAR_SIGNAL" waybar 2>/dev/null || true
+}
+
+stale_count_file() {
+    printf '%s/wireguard-status-stale.count\n' "${XDG_RUNTIME_DIR:-/tmp}"
+}
+
+poll_stamp_file() {
+    printf '%s/wireguard-status-poll.stamp\n' "${XDG_RUNTIME_DIR:-/tmp}"
+}
+
+# Update the last-poll timestamp on every status() run and report whether the
+# gap since the previous poll is large enough to imply a suspend/freeze. Echoes
+# 1 (gap detected) or 0; always refreshes the stamp as a side effect.
+poll_gap_detected() {
+    local file now last
+    file="$(poll_stamp_file)"
+    now="$(date +%s)"
+    last="$(cat "$file" 2>/dev/null || echo 0)"
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    printf '%s\n' "$now" >"$file" 2>/dev/null || true
+    if [ "$last" -gt 0 ] && [ $((now - last)) -ge "$AUTORECONNECT_GAP_THRESHOLD" ]; then
+        echo 1
+    else
+        echo 0
+    fi
+}
+
+reset_stale_count() {
+    rm -f "$(stale_count_file)" 2>/dev/null || true
+}
+
+record_stale_check() {
+    local file count
+    file="$(stale_count_file)"
+    count="$(cat "$file" 2>/dev/null || echo 0)"
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    count=$((count + 1))
+    printf '%s\n' "$count" >"$file" 2>/dev/null || true
+    [ "$count" -ge "$AUTORECONNECT_STALE_THRESHOLD" ]
+}
+
+notify() {
+    command -v notify-send >/dev/null || return 0
+    notify-send "$@" 2>/dev/null || true
+}
+
+last_log_line() {
+    tail -n 1 "$LOG_FILE" 2>/dev/null | sed 's/[[:cntrl:]]//g'
+}
+
+failure_message() {
+    [ -r "$FAILURE_STATE" ] || return 0
+    head -n 1 "$FAILURE_STATE" 2>/dev/null | sed 's/[[:cntrl:]]//g'
+}
+
+run_wg_action() {
+    local wg_action="$1" target_interface="$2" rc
+
+    # All privileged steps (wg-quick, tailscale bounce, ip-rule fixups) live in
+    # the fixed root-owned helper, which a polkit rule lets us pkexec without a
+    # password. That is what makes auto-reconnect hands-free.
+    pkexec "$RECONNECT_HELPER" "$wg_action" "$target_interface"
+    rc=$?
+
+    refresh_waybar
+    return "$rc"
+}
+
+toggle() {
+    local active_iface wg_action target_interface rc
+
+    active_iface="$(active_interface 2>/dev/null || true)"
+    if [ -n "$active_iface" ]; then
+        target_interface="$active_iface"
+        if vpn_online "$active_iface"; then
+            wg_action="down"
+        else
+            # If the interface is up but traffic does not work, a normal click
+            # should fix the stale/captive-portal-after-wake state, not merely
+            # leave the user one click away from a reconnect.
+            wg_action="reconnect"
+        fi
+    else
+        wg_action="up"
+        target_interface="$INTERFACE"
+    fi
+
+    run_wg_action "$wg_action" "$target_interface"
+    rc=$?
+
+    if [ "$rc" -eq 0 ]; then
+        case "$wg_action" in
+            up) notify "VPN" "WireGuard connected: ${target_interface}" ;;
+            down) notify "VPN" "WireGuard disconnected: ${target_interface}" ;;
+            reconnect) notify "VPN" "WireGuard reconnected: ${target_interface}" ;;
+        esac
+    else
+        notify -u critical "VPN ${wg_action} failed" "wg-quick ${wg_action} ${target_interface} failed: $(last_log_line)"
+    fi
+
+    exit "$rc"
+}
+
+disconnect() {
+    local active_iface rc
+    active_iface="$(active_interface 2>/dev/null || true)"
+    [ -n "$active_iface" ] || exit 0
+
+    run_wg_action down "$active_iface"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        notify "VPN" "WireGuard disconnected: ${active_iface}"
+    else
+        notify -u critical "VPN disconnect failed" "wg-quick down ${active_iface} failed: $(last_log_line)"
+    fi
+    exit "$rc"
+}
+
+reconnect() {
+    local active_iface rc
+    active_iface="$(active_interface 2>/dev/null || true)"
+    [ -n "$active_iface" ] || active_iface="$INTERFACE"
+
+    run_wg_action reconnect "$active_iface"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        notify "VPN" "WireGuard reconnected: ${active_iface}"
+    else
+        notify -u critical "VPN reconnect failed" "wg-quick reconnect ${active_iface} failed: $(last_log_line)"
+    fi
+    exit "$rc"
+}
+
+wake_monitor() {
+    local lock_dir lock_file active_iface attempt
+    lock_dir="${XDG_RUNTIME_DIR:-/tmp}"
+    lock_file="$lock_dir/wireguard-status-wake.lock"
+
+    exec 9>"$lock_file"
+    flock -n 9 || exit 0
+
+    for ((attempt = 1; attempt <= WAKE_ATTEMPTS; attempt++)); do
+        active_iface="$(active_interface 2>/dev/null || true)"
+        if [ -z "$active_iface" ]; then
+            # If the full kill switch is still armed, WireGuard is intended to
+            # be up even if wg0 disappeared during suspend/resume. Reconnect it
+            # with the default interface name instead of exiting and requiring a
+            # manual click. Intentional disconnect disables the kill switch, so
+            # this does not undo a user-requested disconnect.
+            if kill_switch_intended_on; then
+                active_iface="$INTERFACE"
+            else
+                refresh_waybar
+                exit 0
+            fi
+        fi
+
+        if vpn_online "$active_iface"; then
+            refresh_waybar
+            exit 0
+        fi
+
+        if underlay_online; then
+            notify "VPN" "Network is back; reconnecting WireGuard"
+            run_wg_action reconnect "$active_iface"
+            exit $?
+        fi
+
+        if [ "$attempt" -eq 1 ]; then
+            notify -u normal "VPN waiting for network login" \
+                "Captive portal or Wi-Fi not ready. Finish portal login; WireGuard will retry for $((WAKE_ATTEMPTS * WAKE_INTERVAL / 60)) min."
+        fi
+
+        sleep "$WAKE_INTERVAL"
+    done
+
+    refresh_waybar
+    notify -u critical "VPN still offline" "Captive portal may still be blocking WireGuard. Right-click the VPN icon to disconnect, finish login, then left-click to reconnect."
+}
+
+wake() {
+    # Return immediately to hypridle; the monitor may wait for Wi-Fi/captive
+    # portal completion before reconnecting.
+    WIREGUARD_WAKE_BACKGROUND=0 nohup "$0" wake-monitor >/dev/null 2>&1 &
+}
+
+# Single hands-free reconnect attempt, fired from the Waybar poll when the
+# interface is up but traffic is broken (stale after sleep, network drop, or a
+# just-cleared captive portal). Lock + cooldown keep the 5 s poll from stacking
+# or hammering attempts; the wake_monitor lock is shared so the two paths don't
+# fight each other.
+auto_reconnect() {
+    local lock_dir lock_file stamp_file now last active_iface
+    lock_dir="${XDG_RUNTIME_DIR:-/tmp}"
+    lock_file="$lock_dir/wireguard-status-wake.lock"
+    stamp_file="$lock_dir/wireguard-status-autoreconnect.stamp"
+
+    exec 9>"$lock_file"
+    flock -n 9 || exit 0
+
+    now="$(date +%s)"
+    last="$(cat "$stamp_file" 2>/dev/null || echo 0)"
+    [ $((now - last)) -ge "$AUTORECONNECT_COOLDOWN" ] || exit 0
+
+    active_iface="$(active_interface 2>/dev/null || true)"
+    # If wg0 vanished but the kill switch is still armed, WG is intended on;
+    # reconnect it automatically. If the user intentionally disconnected, the
+    # helper disabled the kill switch, so leave it disconnected.
+    if [ -z "$active_iface" ]; then
+        if kill_switch_intended_on; then
+            active_iface="$INTERFACE"
+        else
+            exit 0
+        fi
+    fi
+    if vpn_online "$active_iface"; then exit 0; fi
+    underlay_online || exit 0
+
+    printf '%s\n' "$now" >"$stamp_file"
+    notify "VPN" "Connection stale; reconnecting WireGuard automatically"
+    run_wg_action reconnect "$active_iface"
+    exit $?
+}
+
+status() {
+    local iface tooltip gap
+    iface="$(active_interface 2>/dev/null || true)"
+    # Always refresh the poll timestamp; a large gap means we were asleep/frozen
+    # and should reconnect now rather than waiting out the consecutive counter.
+    gap="$(poll_gap_detected)"
+
+    if [ -n "$iface" ]; then
+        if vpn_online "$iface"; then
+            reset_stale_count
+            tooltip="VPN: Online (${iface})\\nConnectivity check passed through WireGuard\\nLeft-click to disconnect"
+            echo "{\"text\": \"󰖂\", \"class\": \"connected\", \"tooltip\": \"${tooltip}\"}"
+        else
+            tooltip="VPN: Enabled but offline (${iface})\\n$(failure_message)\\nKill switch should block public fallback traffic\\nWill auto-reconnect after ${AUTORECONNECT_STALE_THRESHOLD} consecutive stale checks (sooner after sleep)\\nLeft-click to reconnect now; right-click to disconnect for portal login"
+            echo "{\"text\": \"󰖂\", \"class\": \"stale\", \"tooltip\": \"${tooltip}\"}"
+            # Do not bounce wg0 on one missed curl; require consecutive stale
+            # polls so transient packet loss/DNS/check-server slowness doesn't
+            # cause repeated full reconnects. A large poll gap (suspend/freeze)
+            # bypasses the counter since the prior checks are no longer relevant.
+            if [ "$AUTORECONNECT" = "1" ] && { [ "$gap" = "1" ] || record_stale_check; }; then
+                nohup "$0" auto-reconnect >/dev/null 2>&1 &
+            fi
+        fi
+    else
+        if kill_switch_intended_on; then
+            tooltip="VPN: Intended on but interface is missing\\n$(failure_message)\\nKill switch should block public fallback traffic\\nWill auto-reconnect after ${AUTORECONNECT_STALE_THRESHOLD} consecutive stale checks (sooner after sleep)\\nLeft-click to reconnect now; right-click to disconnect intentionally"
+            echo "{\"text\": \"󰖂\", \"class\": \"stale\", \"tooltip\": \"${tooltip}\"}"
+            if [ "$AUTORECONNECT" = "1" ] && { [ "$gap" = "1" ] || record_stale_check; }; then
+                nohup "$0" auto-reconnect >/dev/null 2>&1 &
+            fi
+        else
+            reset_stale_count
+            printf '%s\n' '{"text": "󰖂", "class": "disconnected", "tooltip": "VPN: Disconnected\nLeft-click to connect"}'
+        fi
+    fi
+}
+
+case "${1:-}" in
+    toggle)
+        toggle
+        ;;
+    disconnect)
+        disconnect
+        ;;
+    reconnect)
+        reconnect
+        ;;
+    wake)
+        wake
+        ;;
+    wake-monitor)
+        wake_monitor
+        ;;
+    auto-reconnect)
+        auto_reconnect
+        ;;
+    *)
+        status
+        ;;
+esac

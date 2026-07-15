@@ -1,0 +1,12 @@
+[Unit]
+Description=Enable WireGuard by default at system startup
+After=network.target iwd.service systemd-networkd.service tailscaled.service wireguard-killswitch.service wireguard-monitor.service
+Wants=wireguard-killswitch.service wireguard-monitor.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/wireguard-autostart
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

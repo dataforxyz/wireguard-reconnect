@@ -1,13 +1,13 @@
 [Unit]
-Description=Monitor network changes and reconnect WireGuard
-After=network-online.target
-Wants=network-online.target
+Description=Monitor physical network changes and repair WireGuard
+After=network.target iwd.service systemd-networkd.service wireguard-killswitch.service
+Wants=network.target wireguard-killswitch.service
 
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/wireguard-monitor
 Restart=always
-RestartSec=5
+RestartSec=3
 
 [Install]
 WantedBy=multi-user.target

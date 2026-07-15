@@ -1,0 +1,420 @@
+#!/usr/bin/env bash
+# Dedicated nftables kill switch for the local WireGuard full-tunnel setup.
+#
+# Enabled state means: while WireGuard is intended to be active, local public
+# internet traffic may leave only over wg0. Exceptions are loopback, wg0,
+# tailscale0, Tailscale's own marked underlay sockets, LAN/private/multicast
+# destinations, DHCP, and the WireGuard endpoint/bootstrap socket.
+
+set -euo pipefail
+
+TABLE_FAMILY="${WG_KILLSWITCH_TABLE_FAMILY:-inet}"
+TABLE_NAME="${WG_KILLSWITCH_TABLE_NAME:-wg_killswitch}"
+STATE_FILE="${WG_KILLSWITCH_STATE_FILE:-/run/wg-killswitch.enabled}"
+ROLLBACK_TOKEN_FILE="${WG_KILLSWITCH_ROLLBACK_TOKEN_FILE:-/run/wg-killswitch.rollback-token}"
+ENDPOINT_STATE_FILE="${WG_KILLSWITCH_ENDPOINT_STATE_FILE:-/run/wg-killswitch.endpoint}"
+PERSISTENT_STATE_DIR="${WG_KILLSWITCH_PERSISTENT_STATE_DIR:-/var/lib/wg-killswitch}"
+PERSISTENT_ENDPOINT_STATE_FILE="$PERSISTENT_STATE_DIR/endpoint"
+LOG_FILE="${WG_KILLSWITCH_LOG_FILE:-/run/wg-killswitch.log}"
+WG_CONFIG_DIR="${WG_CONFIG_DIR:-/etc/wireguard}"
+DEFAULT_IFACE="${WIREGUARD_INTERFACE:-wg0}"
+DEFAULT_WG_MARK="0xca6c"
+TAILSCALE_MARK_MASK="0x00ff0000"
+TAILSCALE_MARK_VALUE="0x00080000"
+
+log() {
+  printf '[%s] %s\n' "$(date -Is)" "$*" >> "$LOG_FILE"
+  logger -t wg-killswitch "$*" 2>/dev/null || true
+}
+
+state_value() {
+  local file="$1" key="$2"
+  awk -F= -v key="$key" '$1 == key {print substr($0, length(key) + 2); exit}' "$file" 2>/dev/null
+}
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: wg-killswitch enable|enable-rollback|confirm|refresh|disable|status [iface]
+
+  enable             Enable and record intended-on state.
+  enable-rollback    Enable and schedule automatic disable unless confirm runs.
+                     Optional env: WG_KILLSWITCH_ROLLBACK_SECONDS=90
+  confirm            Cancel pending rollback after connectivity is verified.
+  refresh            Rebuild rules only if intended-on state/table exists.
+  disable            Remove rules and intended-on state.
+  status             Print enabled/disabled status and recent rule metadata.
+EOF
+}
+
+valid_iface() {
+  [[ "$1" =~ ^wg[0-9]+$ ]]
+}
+
+conf_for_iface() {
+  printf '%s/%s.conf' "$WG_CONFIG_DIR" "$1"
+}
+
+endpoint_from_wg_or_conf() {
+  local iface="$1" conf ep
+  ep="$(wg show "$iface" endpoints 2>/dev/null | awk 'NF >= 2 && $2 != "(none)" {print $2; exit}' || true)"
+  if [[ -n "$ep" ]]; then
+    printf '%s\n' "$ep"
+    return 0
+  fi
+
+  conf="$(conf_for_iface "$iface")"
+  [[ -r "$conf" ]] || return 1
+  awk -F= '
+    /^[[:space:]]*Endpoint[[:space:]]*=/ {
+      ep=$2
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", ep)
+      print ep
+      exit
+    }
+  ' "$conf"
+}
+
+parse_endpoint() {
+  local ep="$1" host port
+  if [[ "$ep" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[2]}"
+  elif [[ "$ep" =~ ^([^:]+):([0-9]+)$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[2]}"
+  else
+    return 1
+  fi
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\t%s\n' "$host" "$port"
+}
+
+wg_mark() {
+  local iface="$1" mark
+  mark="$(wg show "$iface" fwmark 2>/dev/null | awk 'NF {print $1; exit}' || true)"
+  if [[ -z "$mark" || "$mark" == "off" ]]; then
+    mark="$DEFAULT_WG_MARK"
+  fi
+  printf '%s\n' "$mark"
+}
+
+resolve_endpoint_ips() {
+  local host="$1" family="$2"
+  if [[ "$family" == "4" && "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    printf '%s\n' "$host"
+    return 0
+  fi
+  if [[ "$family" == "6" && "$host" == *:* ]]; then
+    printf '%s\n' "$host"
+    return 0
+  fi
+
+  if [[ "$family" == "4" ]]; then
+    getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u
+  else
+    getent ahostsv6 "$host" 2>/dev/null | awk '$1 !~ /^::ffff:/ {print $1}' | sort -u
+  fi
+}
+
+csv_or_empty() {
+  local first=1 item
+  while IFS= read -r item; do
+    [[ -n "$item" ]] || continue
+    if (( first )); then
+      printf '%s' "$item"
+      first=0
+    else
+      printf ', %s' "$item"
+    fi
+  done
+}
+
+remove_public_dns_host_routes() {
+  # systemd-networkd/resolved sometimes leaves public DNS host routes (for
+  # example 1.1.1.1/8.8.8.8) in main via wlan0. Those beat wg-quick's
+  # full-tunnel rule and become leaks unless removed or blocked. Remove the
+  # common public resolver host routes when they are present; LAN DNS remains
+  # allowed by the nft private ranges.
+  local ip
+  for ip in 1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 9.9.9.9 149.112.112.112 208.67.222.222 208.67.220.220; do
+    while ip -4 route del "$ip" table main 2>/dev/null; do :; done
+  done
+}
+
+install_emergency_guard() {
+  local iface="$1" mark="$2" prelude tmp
+  if has_table; then
+    prelude="flush table $TABLE_FAMILY $TABLE_NAME"
+  else
+    prelude=""
+  fi
+  tmp="$(mktemp)"
+  cat >"$tmp" <<EOF
+$prelude
+table $TABLE_FAMILY $TABLE_NAME {
+  chain output {
+    type filter hook output priority filter; policy drop;
+    oifname "lo" accept
+    oifname "$iface" accept
+    oifname "tailscale0" accept
+    oifname "docker0" accept
+    oifname "br-*" accept
+    meta mark $mark accept
+    meta mark & $TAILSCALE_MARK_MASK == $TAILSCALE_MARK_VALUE accept
+    ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255/32 } accept
+    ip6 daddr { ::1/128, fc00::/7, fe80::/10, ff00::/8 } accept
+    udp sport 68 udp dport 67 accept
+    reject with icmpx type admin-prohibited comment "emergency block public non-WireGuard egress"
+  }
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+    oifname "$iface" accept
+    oifname "tailscale0" accept
+    ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255/32 } accept
+    ip6 daddr { ::1/128, fc00::/7, fe80::/10, ff00::/8 } accept
+    reject with icmpx type admin-prohibited comment "emergency block forwarded public egress"
+  }
+}
+EOF
+  if nft -f "$tmp"; then
+    rm -f "$tmp"
+    printf '%s\n' "$iface" >"$STATE_FILE"
+    chmod 0644 "$STATE_FILE" 2>/dev/null || true
+    log "CRITICAL: installed emergency policy-drop guard for $iface"
+    return 0
+  fi
+  rm -f "$tmp"
+  log "CRITICAL: nftables rejected both the normal and emergency guards"
+  return 1
+}
+
+enable_rules() {
+  local iface="$1" conf ep parsed host port mark ep4 ep6 ep4_first ep6_first
+  local cached_host cached_port cached4 cached6 tmp endpoint_rules4 endpoint_rules6 table_prelude unresolved=0
+  valid_iface "$iface" || { echo "Invalid interface: $iface" >&2; exit 2; }
+  conf="$(conf_for_iface "$iface")"
+  [[ -f "$conf" ]] || { echo "Missing WireGuard config: $conf" >&2; exit 2; }
+
+  ep="$(endpoint_from_wg_or_conf "$iface" || true)"
+  if [[ -n "$ep" ]]; then
+    parsed="$(parse_endpoint "$ep" || true)"
+  else
+    parsed=""
+  fi
+  if [[ -n "$parsed" ]]; then
+    host="$(awk '{print $1}' <<<"$parsed")"
+    port="$(awk '{print $2}' <<<"$parsed")"
+  else
+    host=""
+    port=""
+  fi
+
+  mark="$(wg_mark "$iface")"
+  ep4=""
+  ep6=""
+  if [[ -n "$host" ]]; then
+    ep4="$(resolve_endpoint_ips "$host" 4 | csv_or_empty || true)"
+    ep6="$(resolve_endpoint_ips "$host" 6 | csv_or_empty || true)"
+  fi
+
+  # DNS may be unavailable during very early boot. Reuse only a root-owned
+  # endpoint cache that matches the current config's host and port.
+  if [[ -z "$ep4" && -z "$ep6" && -r "$PERSISTENT_ENDPOINT_STATE_FILE" ]]; then
+    cached_host="$(state_value "$PERSISTENT_ENDPOINT_STATE_FILE" ENDPOINT_HOST)"
+    cached_port="$(state_value "$PERSISTENT_ENDPOINT_STATE_FILE" ENDPOINT_PORT)"
+    if [[ -n "$host" && "$host" == "$cached_host" && "$port" == "$cached_port" ]]; then
+      cached4="$(state_value "$PERSISTENT_ENDPOINT_STATE_FILE" ENDPOINT4)"
+      cached6="$(state_value "$PERSISTENT_ENDPOINT_STATE_FILE" ENDPOINT6)"
+      ep4="$cached4"
+      ep6="$cached6"
+      log "using persistent endpoint cache for early-boot guard: ${host}:${port}"
+    fi
+  fi
+
+  endpoint_rules4=""
+  endpoint_rules6=""
+  if [[ -n "$port" && -n "$ep4" ]]; then
+    endpoint_rules4="    ip daddr { $ep4 } udp dport $port accept comment \"WireGuard endpoint IPv4\""
+  fi
+  if [[ -n "$port" && -n "$ep6" ]]; then
+    endpoint_rules6="    ip6 daddr { $ep6 } udp dport $port accept comment \"WireGuard endpoint IPv6\""
+  fi
+  if [[ -z "$port" || ( -z "$ep4" && -z "$ep6" ) ]]; then
+    # Still install the blocking guard below. Returning failure afterward keeps
+    # WireGuard down while allowing a later retry after LAN DNS becomes ready.
+    unresolved=1
+  fi
+
+  remove_public_dns_host_routes || true
+
+  if has_table; then
+    table_prelude="flush table $TABLE_FAMILY $TABLE_NAME"
+  else
+    table_prelude=""
+  fi
+
+  tmp="$(mktemp)"
+  cat > "$tmp" <<EOF
+$table_prelude
+table $TABLE_FAMILY $TABLE_NAME {
+  set private4 {
+    type ipv4_addr
+    flags interval
+    elements = { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255/32 }
+  }
+
+  set private6 {
+    type ipv6_addr
+    flags interval
+    elements = { ::1/128, fc00::/7, fe80::/10, ff00::/8 }
+  }
+
+  chain output {
+    type filter hook output priority filter; policy drop;
+    oifname "lo" accept comment "loopback"
+    oifname "$iface" accept comment "WireGuard tunnel"
+    oifname "tailscale0" accept comment "Tailscale tunnel"
+    oifname "docker0" accept comment "local Docker bridge"
+    oifname "br-*" accept comment "local bridge networks"
+    meta mark $mark accept comment "WireGuard UDP socket fwmark"
+    meta mark & $TAILSCALE_MARK_MASK == $TAILSCALE_MARK_VALUE accept comment "Tailscale marked underlay sockets"
+    ip daddr @private4 accept comment "LAN/private/tailnet IPv4"
+    ip6 daddr @private6 accept comment "LAN/private/tailnet IPv6"
+    udp sport 68 udp dport 67 accept comment "DHCP client"
+$endpoint_rules4
+$endpoint_rules6
+    reject with icmpx type admin-prohibited comment "block public non-WireGuard egress"
+  }
+
+  chain forward {
+    type filter hook forward priority filter; policy drop;
+    oifname "$iface" accept comment "forward via WireGuard"
+    oifname "tailscale0" accept comment "forward via Tailscale"
+    ip daddr @private4 accept comment "forward to LAN/private/tailnet IPv4"
+    ip6 daddr @private6 accept comment "forward to LAN/private/tailnet IPv6"
+    reject with icmpx type admin-prohibited comment "block forwarded public non-WireGuard egress"
+  }
+}
+EOF
+
+  # This is one atomic nft transaction. If a previous guard exists, a failed
+  # refresh leaves it intact rather than creating an empty/exposed table.
+  if ! nft -f "$tmp"; then
+    rm -f "$tmp"
+    log "CRITICAL: failed to install full nftables guard for $iface; applying emergency policy-drop guard"
+    install_emergency_guard "$iface" "$mark" || true
+    return 1
+  fi
+  rm -f "$tmp"
+
+  ep4_first="${ep4%%,*}"
+  ep6_first="${ep6%%,*}"
+  {
+    printf 'IFACE=%s\n' "$iface"
+    printf 'ENDPOINT_HOST=%s\n' "${host:-}"
+    printf 'ENDPOINT_PORT=%s\n' "${port:-}"
+    printf 'ENDPOINT4=%s\n' "$ep4_first"
+    printf 'ENDPOINT6=%s\n' "$ep6_first"
+    printf 'WG_MARK=%s\n' "$mark"
+  } > "$ENDPOINT_STATE_FILE"
+  chmod 0644 "$ENDPOINT_STATE_FILE" 2>/dev/null || true
+
+  printf '%s\n' "$iface" > "$STATE_FILE"
+  chmod 0644 "$STATE_FILE" 2>/dev/null || true
+
+  if (( unresolved )); then
+    log "CRITICAL: guard is blocking public traffic, but WireGuard endpoint could not be resolved"
+    return 1
+  fi
+
+  install -d -m 0700 "$PERSISTENT_STATE_DIR"
+  cp "$ENDPOINT_STATE_FILE" "$PERSISTENT_ENDPOINT_STATE_FILE"
+  chmod 0600 "$PERSISTENT_ENDPOINT_STATE_FILE"
+  log "enabled and verified iface=$iface endpoint=${host}:${port} ep4=${ep4:-none} ep6=${ep6:-none} mark=$mark"
+}
+
+disable_rules() {
+  nft delete table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null || true
+  rm -f "$STATE_FILE" "$ROLLBACK_TOKEN_FILE" "$ENDPOINT_STATE_FILE"
+  log "disabled"
+}
+
+has_table() {
+  nft list table "$TABLE_FAMILY" "$TABLE_NAME" >/dev/null 2>&1
+}
+
+verify_rules() {
+  local rules
+  [[ -f "$STATE_FILE" ]] || return 1
+  rules="$(nft list table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null)" || return 1
+  grep -q 'hook output.*policy drop' <<<"$rules" || return 1
+  grep -q 'hook forward.*policy drop' <<<"$rules" || return 1
+  grep -q 'WireGuard endpoint IPv' <<<"$rules" || return 1
+  grep -q 'block public non-WireGuard egress' <<<"$rules" || return 1
+}
+
+status_rules() {
+  local iface=""
+  [[ -f "$STATE_FILE" ]] && iface="$(cat "$STATE_FILE" 2>/dev/null || true)"
+  if verify_rules; then
+    echo "enabled verified iface=${iface:-unknown}"
+    nft list table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null | sed -n '1,120p'
+  elif has_table; then
+    echo "blocked-unready iface=${iface:-unknown}"
+    return 1
+  else
+    echo "disabled"
+    return 1
+  fi
+}
+
+schedule_rollback() {
+  local seconds="${WG_KILLSWITCH_ROLLBACK_SECONDS:-90}" token
+  [[ "$seconds" =~ ^[0-9]+$ ]] || seconds=90
+  token="$(date +%s)-$$-$RANDOM"
+  printf '%s\n' "$token" > "$ROLLBACK_TOKEN_FILE"
+  chmod 0644 "$ROLLBACK_TOKEN_FILE" 2>/dev/null || true
+  (
+    sleep "$seconds"
+    if [[ -f "$ROLLBACK_TOKEN_FILE" ]] && [[ "$(cat "$ROLLBACK_TOKEN_FILE" 2>/dev/null || true)" == "$token" ]]; then
+      /usr/local/bin/wg-killswitch disable
+      logger -t wg-killswitch "rollback disabled kill switch after ${seconds}s without confirm"
+    fi
+  ) >/dev/null 2>&1 &
+  log "rollback scheduled seconds=$seconds token=$token"
+}
+
+main() {
+  local action="${1:-}" iface="${2:-$DEFAULT_IFACE}"
+  case "$action" in
+    enable)
+      enable_rules "$iface"
+      ;;
+    enable-rollback)
+      enable_rules "$iface"
+      schedule_rollback
+      ;;
+    confirm)
+      rm -f "$ROLLBACK_TOKEN_FILE"
+      log "confirmed"
+      ;;
+    refresh)
+      if [[ -f "$STATE_FILE" ]] || has_table; then
+        [[ -f "$STATE_FILE" ]] && iface="$(cat "$STATE_FILE" 2>/dev/null || printf '%s' "$iface")"
+        enable_rules "$iface"
+      fi
+      ;;
+    disable)
+      disable_rules
+      ;;
+    status)
+      status_rules
+      ;;
+    *)
+      usage
+      exit 2
+      ;;
+  esac
+}
+
+main "$@"

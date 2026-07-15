@@ -1,10 +1,252 @@
 #!/bin/bash
-# Bounce all active WireGuard interfaces to restore connectivity
+# Privileged WireGuard reconnect helper.
+#
+# Installed root-owned at /usr/local/bin/wireguard-reconnect and granted
+# passwordless pkexec via /etc/polkit-1/rules.d/49-wireguard-reconnect.rules so
+# that wireguard-status can connect/disconnect/reconnect hands-free.
+#
+# Fixed behaviour only: the action is validated against a whitelist and the
+# interface against ^wg[0-9]+$ with an existing /etc/wireguard/<iface>.conf.
+# No caller-supplied paths or commands are executed, so granting this one
+# program passwordless is strictly narrower than passwordless bash.
 
-for iface in $(ip link show type wireguard 2>/dev/null | awk -F'[ :]' '/^[0-9]/ {print $3}'); do
-    if [ -f "/etc/wireguard/${iface}.conf" ]; then
-        logger -t wireguard-reconnect "Bouncing $iface"
-        wg-quick down "$iface" 2>/dev/null
-        wg-quick up "$iface"
+set -u
+
+LOG_FILE="/run/wireguard-reconnect.log"
+FAILURE_STATE="/run/wireguard-reconnect.failure"
+LOCK_FILE="/run/wireguard-reconnect.lock"
+INTENT_STATE="${WIREGUARD_INTENT_STATE:-/run/wireguard-reconnect.enabled}"
+KILLSWITCH_HELPER="/usr/local/bin/wg-killswitch"
+KILLSWITCH_ENABLED="${WIREGUARD_KILLSWITCH:-1}"
+KILLSWITCH_STATE="/run/wg-killswitch.enabled"
+KILLSWITCH_ENDPOINT_STATE="/run/wg-killswitch.endpoint"
+BOOTSTRAP_DIR="/run/wireguard-reconnect"
+TAILSCALE_OPERATOR="${TAILSCALE_OPERATOR:-dxyz}"
+
+ACTION="${1:-}"
+IFACE="${2:-wg0}"
+WG_CONF="/etc/wireguard/${IFACE}.conf"
+
+# Reject anything that is not a plain wgN name so a caller cannot point us at
+# an attacker-controlled config (wg-quick configs can contain PostUp scripts).
+if ! [[ "$IFACE" =~ ^wg[0-9]+$ ]]; then
+    echo "Invalid interface: $IFACE" >"$LOG_FILE"
+    exit 2
+fi
+if [ ! -f "$WG_CONF" ]; then
+    echo "No such WireGuard config: $WG_CONF" >"$LOG_FILE"
+    exit 2
+fi
+case "$ACTION" in
+    up|down|reconnect) ;;
+    *)
+        echo "Unknown WireGuard action: $ACTION" >"$LOG_FILE"
+        exit 2
+        ;;
+esac
+
+# Serialize Waybar, boot, resume, and network-monitor requests so two wg-quick
+# operations can never rewrite policy routes/nftables at the same time.
+exec 9>"$LOCK_FILE"
+if ! flock -w 30 9; then
+    echo "Timed out waiting for another WireGuard action" >"$LOG_FILE"
+    exit 1
+fi
+
+: >"$LOG_FILE"
+chmod 0644 "$LOG_FILE" 2>/dev/null || true
+
+critical() {
+    local message="$*"
+    printf 'CRITICAL: %s\n' "$message" >>"$LOG_FILE"
+    printf '%s\n' "$message" >"$FAILURE_STATE"
+    chmod 0644 "$FAILURE_STATE" 2>/dev/null || true
+    logger -p daemon.crit -t wireguard-reconnect "CRITICAL: $message" 2>/dev/null || true
+    printf 'wireguard-reconnect: CRITICAL: %s\n' "$message" >&2
+}
+
+clear_failure() {
+    rm -f "$FAILURE_STATE"
+}
+
+# This runtime marker records intent independently of interface health. A
+# deliberate disconnect clears it; boot recreates it because VPN-on is the
+# default policy for each new system session.
+case "$ACTION" in
+    up|reconnect)
+        printf '%s\n' "$IFACE" >"$INTENT_STATE"
+        chmod 0644 "$INTENT_STATE" 2>/dev/null || true
+        ;;
+    down)
+        rm -f "$INTENT_STATE"
+        ;;
+esac
+
+kill_switch_active() {
+    [ -f "$KILLSWITCH_STATE" ] || return 1
+    [ -x "$KILLSWITCH_HELPER" ] || return 1
+    "$KILLSWITCH_HELPER" status 2>/dev/null | /usr/bin/head -n1 | /usr/bin/grep -q '^enabled'
+}
+
+state_value() {
+    local key="$1"
+    /usr/bin/awk -F= -v key="$key" '$1 == key {print substr($0, length(key) + 2); exit}' "$KILLSWITCH_ENDPOINT_STATE" 2>/dev/null
+}
+
+bootstrap_config_for_up() {
+    # If the kill switch is already active and wg0 is down, DNS over wlan0 is
+    # intentionally blocked. wg-quick cannot resolve a hostname Endpoint in
+    # that state, so reuse the last endpoint IP that wg-killswitch recorded
+    # while the tunnel was healthy. This keeps reconnect bootstrap limited to
+    # the WireGuard server endpoint, not general public internet/DNS.
+    local port ep4 ep6 endpoint tmp
+    if ! kill_switch_active; then
+        printf '%s\n' "$WG_CONF"
+        return 0
     fi
-done
+
+    port="$(state_value ENDPOINT_PORT)"
+    ep4="$(state_value ENDPOINT4)"
+    ep6="$(state_value ENDPOINT6)"
+    endpoint=""
+    if [ -n "$ep4" ] && [ -n "$port" ]; then
+        endpoint="${ep4}:${port}"
+    elif [ -n "$ep6" ] && [ -n "$port" ]; then
+        endpoint="[${ep6}]:${port}"
+    fi
+
+    if [ -z "$endpoint" ]; then
+        printf '%s\n' "$WG_CONF"
+        return 0
+    fi
+
+    /usr/bin/install -d -m 0700 "$BOOTSTRAP_DIR"
+    tmp="$BOOTSTRAP_DIR/${IFACE}.conf"
+    /usr/bin/awk -v endpoint="$endpoint" '
+        /^[[:space:]]*Endpoint[[:space:]]*=/ { print "Endpoint = " endpoint; next }
+        { print }
+    ' "$WG_CONF" > "$tmp"
+    /usr/bin/chmod 0600 "$tmp"
+    echo "[#] using cached WireGuard endpoint for kill-switch bootstrap: $endpoint" >>"$LOG_FILE"
+    printf '%s\n' "$tmp"
+}
+
+wg_quick_up() {
+    local conf
+    conf="$(bootstrap_config_for_up)"
+    /usr/bin/wg-quick up "$conf"
+}
+
+arm_and_verify_kill_switch() {
+    [ "$KILLSWITCH_ENABLED" = "1" ] || return 0
+    if [ ! -x "$KILLSWITCH_HELPER" ]; then
+        critical "kill-switch helper is missing; refusing to bring up $IFACE"
+        return 1
+    fi
+
+    echo "[#] pre-arming and verifying wg-killswitch for $IFACE" >>"$LOG_FILE"
+    if ! /usr/bin/timeout 15s "$KILLSWITCH_HELPER" enable "$IFACE" >>"$LOG_FILE" 2>&1; then
+        critical "could not arm and verify the kill switch; refusing to bring up $IFACE"
+        return 1
+    fi
+    if ! kill_switch_active; then
+        critical "kill-switch verification failed; refusing to bring up $IFACE"
+        return 1
+    fi
+}
+
+# A connect/reconnect is never allowed to start without a verified nftables
+# guard. During reconnect the guard remains active while wg0 is absent, so
+# public traffic is blocked rather than falling back to the physical network.
+if [ "$ACTION" != "down" ]; then
+    arm_and_verify_kill_switch || exit 1
+fi
+
+# Intentionally disconnecting is the only action that removes the guard. This
+# deliberately restores direct internet for captive portals/troubleshooting.
+if [ "$ACTION" = "down" ] && [ "$KILLSWITCH_ENABLED" = "1" ]; then
+    if [ ! -x "$KILLSWITCH_HELPER" ]; then
+        critical "kill-switch helper is missing; refusing an incomplete disconnect"
+        exit 1
+    fi
+    echo "[#] wg-killswitch disable" >>"$LOG_FILE"
+    if ! "$KILLSWITCH_HELPER" disable >>"$LOG_FILE" 2>&1; then
+        critical "failed to disable the kill switch during intentional disconnect"
+        exit 1
+    fi
+fi
+
+case "$ACTION" in
+    up)
+        if ! wg_quick_up >>"$LOG_FILE" 2>&1; then
+            critical "wg-quick up $IFACE failed; kill switch remains active"
+            exit 1
+        fi
+        ;;
+    down)
+        if ! /usr/bin/wg-quick down "$IFACE" >>"$LOG_FILE" 2>&1; then
+            critical "wg-quick down $IFACE failed"
+            exit 1
+        fi
+        ;;
+    reconnect)
+        echo "[#] wg-quick down $IFACE" >>"$LOG_FILE"
+        /usr/bin/wg-quick down "$IFACE" >>"$LOG_FILE" 2>&1 || true
+        sleep 1
+        echo "[#] wg-quick up $IFACE" >>"$LOG_FILE"
+        if ! wg_quick_up >>"$LOG_FILE" 2>&1; then
+            critical "wg-quick reconnect $IFACE failed; kill switch remains active"
+            exit 1
+        fi
+        ;;
+esac
+
+# Keep Tailscale online across WireGuard reconnects. Older versions bounced
+# Tailscale here, but a failed follow-up "tailscale up" left the node stopped.
+if [ -x /usr/bin/tailscale ]; then
+    {
+        if /usr/bin/tailscale status >/dev/null 2>&1; then
+            echo "[#] tailscale already running"
+        else
+            echo "[#] tailscale up --accept-dns --accept-routes --operator=$TAILSCALE_OPERATOR"
+            /usr/bin/tailscale up --accept-dns --accept-routes --operator="$TAILSCALE_OPERATOR" \
+                || /usr/bin/tailscale up --accept-dns --accept-routes --operator="$TAILSCALE_OPERATOR" \
+                || true
+        fi
+        /usr/bin/resolvectl flush-caches 2>/dev/null || true
+    } >>"$LOG_FILE" 2>&1
+fi
+
+# wg-quick chooses policy-rule preferences dynamically and they can move after
+# reconnect/sleep. Keep tailnet routes ahead of both wg-quick full-tunnel rules
+# so 100.64.0.0/10 peers are never sent into wg0.
+wg_first_pref="$({
+    /usr/bin/ip -4 rule show | /usr/bin/awk '/lookup main suppress_prefixlength 0/ {sub(":", "", $1); print $1}'
+    /usr/bin/ip -4 rule show | /usr/bin/awk '/not from all fwmark .* lookup 51820/ {sub(":", "", $1); print $1}'
+} | /usr/bin/sort -n | /usr/bin/head -n1)"
+[ -n "$wg_first_pref" ] || wg_first_pref=5185
+tail_pref=$((wg_first_pref - 1))
+
+# Remove stale copies at older priorities, then add the one correct priority.
+while /usr/bin/ip -4 rule del to 100.64.0.0/10 lookup 52 2>/dev/null; do :; done
+/usr/bin/ip -4 rule add pref "$tail_pref" to 100.64.0.0/10 lookup 52 2>/dev/null || true
+
+if /usr/bin/ip -6 route show table 52 | /usr/bin/grep -q "dev tailscale0"; then
+    while /usr/bin/ip -6 rule del to fd7a:115c:a1e0::/48 lookup 52 2>/dev/null; do :; done
+    /usr/bin/ip -6 rule add pref "$tail_pref" to fd7a:115c:a1e0::/48 lookup 52 2>/dev/null || true
+fi
+
+# Refresh and verify again after wg-quick has installed its final fwmark/routes.
+# If this verification fails, take wg0 back down while leaving the pre-armed
+# guard in place. That is fail-closed: no verified guard means no VPN traffic.
+if [ "$ACTION" != "down" ] && [ "$KILLSWITCH_ENABLED" = "1" ]; then
+    echo "[#] refreshing and verifying wg-killswitch for $IFACE" >>"$LOG_FILE"
+    if ! /usr/bin/timeout 15s "$KILLSWITCH_HELPER" enable "$IFACE" >>"$LOG_FILE" 2>&1 || ! kill_switch_active; then
+        /usr/bin/wg-quick down "$IFACE" >>"$LOG_FILE" 2>&1 || true
+        critical "post-connect kill-switch verification failed; $IFACE was taken down and public traffic remains blocked"
+        exit 1
+    fi
+fi
+
+clear_failure
+exit 0
