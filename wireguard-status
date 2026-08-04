@@ -211,16 +211,20 @@ toggle() {
 }
 
 disconnect() {
-    local active_iface rc
+    local active_iface target_interface rc
     active_iface="$(active_interface 2>/dev/null || true)"
-    [ -n "$active_iface" ] || exit 0
+    target_interface="${active_iface:-$INTERFACE}"
 
-    run_wg_action down "$active_iface"
+    # Always run the privileged down action, even if wg0 is already missing.
+    # The interface can disappear while the fail-closed guard and intended-on
+    # markers remain, which is exactly when an intentional disconnect/reset is
+    # needed to restore direct captive-portal or troubleshooting traffic.
+    run_wg_action down "$target_interface"
     rc=$?
     if [ "$rc" -eq 0 ]; then
-        notify "VPN" "WireGuard disconnected: ${active_iface}"
+        notify "VPN" "WireGuard disconnected: ${target_interface}"
     else
-        notify -u critical "VPN disconnect failed" "wg-quick down ${active_iface} failed: $(last_log_line)"
+        notify -u critical "VPN disconnect failed" "wg-quick down ${target_interface} failed: $(last_log_line)"
     fi
     exit "$rc"
 }

@@ -3,6 +3,18 @@
 All notable changes to this project are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Added Make targets matching the Waybar status, toggle, disconnect, connect,
+  and reconnect controls, plus reset, diagnostics, logs, tests, and install.
+
+### Fixed
+
+- Made intentional disconnect idempotent when `wg0` is already missing, so a
+  stuck fail-closed guard can still be cleanly reset for captive-portal access.
+
 ## [1.0.1] - 2026-07-15
 
 ### Fixed

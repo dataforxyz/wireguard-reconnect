@@ -210,9 +210,17 @@ case "$ACTION" in
         fi
         ;;
     down)
-        if ! /usr/bin/wg-quick down "$IFACE" >>"$LOG_FILE" 2>&1; then
-            critical "wg-quick down $IFACE failed"
-            exit 1
+        # Treat an already-missing interface as a successful intentional
+        # disconnect. The important recovery work above has still cleared VPN
+        # intent and disabled the fail-closed guard; reporting failure here used
+        # to leave a misleading critical state after resetting a bricked tunnel.
+        if ip link show "$IFACE" >/dev/null 2>&1; then
+            if ! /usr/bin/wg-quick down "$IFACE" >>"$LOG_FILE" 2>&1; then
+                critical "wg-quick down $IFACE failed"
+                exit 1
+            fi
+        else
+            echo "[#] $IFACE is already absent; disconnect state is clean" >>"$LOG_FILE"
         fi
         ;;
     reconnect)

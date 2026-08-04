@@ -1,0 +1,103 @@
+SHELL := /bin/bash
+
+INTERFACE ?= wg0
+STATUS_SCRIPT ?= ./wireguard-status
+PRIVILEGED_HELPER ?= /usr/local/bin/wireguard-reconnect
+PKEXEC ?= pkexec
+CURL ?= curl
+CHECK_URL ?= https://example.com
+INTENT_STATE ?= /run/wireguard-reconnect.enabled
+KILLSWITCH_STATE ?= /run/wg-killswitch.enabled
+
+.PHONY: help status toggle connect disconnect reconnect reset logs diagnostics test install
+
+help:
+	@printf '%s\n' \
+	  'WireGuard controls:' \
+	  '  make status       Show the same state used by the Waybar icon' \
+	  '  make toggle       Same as left-clicking the Waybar icon' \
+	  '  make disconnect   Same as right-clicking the Waybar icon' \
+	  '  make connect      Explicitly connect WireGuard' \
+	  '  make reconnect    Bounce and reconnect WireGuard' \
+	  '  make reset        Clear VPN intent and the leak-protection guard' \
+	  '' \
+	  'Troubleshooting:' \
+	  '  make logs         Show recent service and helper logs' \
+	  '  make diagnostics  Show interfaces, routes, rules, and VPN state' \
+	  '  make test         Run the repository regression tests' \
+	  '  make install      Install/update the system integration (uses sudo)'
+
+status:
+	@$(STATUS_SCRIPT)
+
+toggle:
+	@$(STATUS_SCRIPT) toggle
+
+connect:
+	@$(PKEXEC) $(PRIVILEGED_HELPER) up $(INTERFACE)
+
+disconnect:
+	@$(STATUS_SCRIPT) disconnect
+
+reconnect:
+	@$(STATUS_SCRIPT) reconnect
+
+# Recovery for a missing/stale wg0 that left the fail-closed guard armed.
+# Older installed helpers return non-zero when wg0 is already absent, even
+# though they successfully clear both intent and the nftables guard. Verify the
+# resulting state instead of treating that harmless condition as a failed reset.
+reset:
+	@set +e; \
+	$(PKEXEC) $(PRIVILEGED_HELPER) down $(INTERFACE); \
+	rc=$$?; \
+	if [[ ! -e $(INTENT_STATE) && ! -e $(KILLSWITCH_STATE) ]]; then \
+	  printf '%s\n' 'WireGuard reset complete: VPN intent and leak-protection guard are off.'; \
+	  $(CURL) --silent --show-error --head --max-time 8 $(CHECK_URL) >/dev/null \
+	    && printf '%s\n' 'Direct internet connectivity check passed.' \
+	    || printf '%s\n' 'Reset succeeded, but the direct internet check did not pass.'; \
+	  exit 0; \
+	fi; \
+	printf '%s\n' 'WireGuard reset failed: intent or leak-protection state is still present.' >&2; \
+	exit "$${rc:-1}"
+
+logs:
+	@journalctl \
+	  -u wireguard-killswitch.service \
+	  -u wireguard-monitor.service \
+	  -u wireguard-autostart.service \
+	  -t wg-killswitch \
+	  -t wireguard-reconnect \
+	  -t wireguard-monitor \
+	  -b --no-pager -n 200
+	@printf '\n-- /run/wireguard-reconnect.log --\n'
+	@tail -n 50 /run/wireguard-reconnect.log 2>/dev/null || true
+	@printf '\n-- /run/wireguard-reconnect.failure --\n'
+	@cat /run/wireguard-reconnect.failure 2>/dev/null || true
+
+diagnostics:
+	@printf '%s\n' '-- status --'
+	@$(STATUS_SCRIPT)
+	@printf '%s\n' '-- WireGuard --'
+	@wg show || true
+	@printf '%s\n' '-- links --'
+	@ip -brief link
+	@printf '%s\n' '-- addresses --'
+	@ip -brief address
+	@printf '%s\n' '-- main routes --'
+	@ip route show table main
+	@printf '%s\n' '-- policy rules --'
+	@ip rule show
+	@printf '%s\n' '-- runtime intent --'
+	@[[ -e /run/wireguard-reconnect.enabled ]] && cat /run/wireguard-reconnect.enabled || echo off
+	@printf '%s\n' '-- leak-protection guard --'
+	@[[ -e /run/wg-killswitch.enabled ]] && cat /run/wg-killswitch.enabled || echo off
+
+test:
+	@./tests/test-killswitch.sh
+	@./tests/test-autostart.sh
+	@./tests/test-status.sh
+	@./tests/test-make-controls.sh
+	@./tests/test-version.sh
+
+install:
+	sudo ./install.sh

@@ -61,6 +61,35 @@ The installer:
 The Waybar module should execute `wireguard-status`, left-click
 `wireguard-status toggle`, and right-click `wireguard-status disconnect`.
 
+## Make commands
+
+Run `make` or `make help` in this repository to list the available controls.
+The common commands mirror the Waybar icon and provide an explicit recovery
+path:
+
+```bash
+make status       # show the icon's current state
+make toggle       # same as left-clicking the icon
+make disconnect   # same as right-clicking the icon
+make connect      # explicitly connect wg0
+make reconnect    # explicitly bounce and reconnect wg0
+make reset        # clear stuck VPN intent and leak protection, even if wg0 is missing
+```
+
+Troubleshooting and maintenance commands are also available:
+
+```bash
+make diagnostics
+make logs
+make test
+make install      # sudo install/update of the system integration
+```
+
+`make reset` is the captive-portal/emergency escape hatch. It intentionally
+leaves WireGuard off, disables the fail-closed guard, and verifies that direct
+internet traffic is available. Re-enable the VPN afterward with `make connect`
+or the Waybar icon.
+
 Check the installed version with:
 
 ```bash
@@ -117,6 +146,8 @@ Run the unprivileged nftables-generation regression test with:
 ```bash
 ./tests/test-killswitch.sh
 ./tests/test-autostart.sh
+./tests/test-status.sh
+./tests/test-make-controls.sh
 ./tests/test-version.sh
 ```
 
