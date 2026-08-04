@@ -15,9 +15,11 @@ ROLLBACK_TOKEN_FILE="${WG_KILLSWITCH_ROLLBACK_TOKEN_FILE:-/run/wg-killswitch.rol
 ENDPOINT_STATE_FILE="${WG_KILLSWITCH_ENDPOINT_STATE_FILE:-/run/wg-killswitch.endpoint}"
 PERSISTENT_STATE_DIR="${WG_KILLSWITCH_PERSISTENT_STATE_DIR:-/var/lib/wg-killswitch}"
 PERSISTENT_ENDPOINT_STATE_FILE="$PERSISTENT_STATE_DIR/endpoint"
+PORTAL_CANDIDATE_STATE_FILE="${WG_KILLSWITCH_PORTAL_CANDIDATE_STATE_FILE:-/run/wg-killswitch.portal-candidate}"
 LOG_FILE="${WG_KILLSWITCH_LOG_FILE:-/run/wg-killswitch.log}"
 WG_CONFIG_DIR="${WG_CONFIG_DIR:-/etc/wireguard}"
 DEFAULT_IFACE="${WIREGUARD_INTERFACE:-wg0}"
+PORTAL_HOST_IFACE="${WIREGUARD_PORTAL_HOST_IFACE:-wgportal0}"
 DEFAULT_WG_MARK="0xca6c"
 TAILSCALE_MARK_MASK="0x00ff0000"
 TAILSCALE_MARK_VALUE="0x00080000"
@@ -34,7 +36,7 @@ state_value() {
 
 usage() {
   cat >&2 <<'EOF'
-Usage: wg-killswitch enable|enable-rollback|confirm|refresh|disable|status [iface]
+Usage: wg-killswitch enable|enable-rollback|confirm|refresh|disable|status|status-portal [iface]
 
   enable             Enable and record intended-on state.
   enable-rollback    Enable and schedule automatic disable unless confirm runs.
@@ -42,7 +44,9 @@ Usage: wg-killswitch enable|enable-rollback|confirm|refresh|disable|status [ifac
   confirm            Cancel pending rollback after connectivity is verified.
   refresh            Rebuild rules only if intended-on state/table exists.
   disable            Remove rules and intended-on state.
-  status             Print enabled/disabled status and recent rule metadata.
+  status             Verify the complete guard, including a WG endpoint rule.
+  status-portal      Verify fail-closed host and isolated portal rules; an
+                     endpoint exception is not required until after login.
 EOF
 }
 
@@ -54,24 +58,27 @@ conf_for_iface() {
   printf '%s/%s.conf' "$WG_CONFIG_DIR" "$1"
 }
 
-endpoint_from_wg_or_conf() {
+endpoint_from_conf_or_wg() {
   local iface="$1" conf ep
-  ep="$(wg show "$iface" endpoints 2>/dev/null | awk 'NF >= 2 && $2 != "(none)" {print $2; exit}' || true)"
-  if [[ -n "$ep" ]]; then
-    printf '%s\n' "$ep"
-    return 0
+  # Prefer the configured hostname so persistent/candidate cache identity stays
+  # stable after wg has replaced it with a resolved runtime IP.
+  conf="$(conf_for_iface "$iface")"
+  if [[ -r "$conf" ]]; then
+    ep="$(awk -F= '
+      /^[[:space:]]*Endpoint[[:space:]]*=/ {
+        value=$2
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+        print value
+        exit
+      }
+    ' "$conf")"
+    if [[ -n "$ep" ]]; then
+      printf '%s\n' "$ep"
+      return 0
+    fi
   fi
 
-  conf="$(conf_for_iface "$iface")"
-  [[ -r "$conf" ]] || return 1
-  awk -F= '
-    /^[[:space:]]*Endpoint[[:space:]]*=/ {
-      ep=$2
-      gsub(/^[[:space:]]+|[[:space:]]+$/, "", ep)
-      print ep
-      exit
-    }
-  ' "$conf"
+  wg show "$iface" endpoints 2>/dev/null | awk 'NF >= 2 && $2 != "(none)" {print $2; exit}'
 }
 
 parse_endpoint() {
@@ -168,6 +175,11 @@ table $TABLE_FAMILY $TABLE_NAME {
   }
   chain forward {
     type filter hook forward priority filter; policy drop;
+    iifname "$PORTAL_HOST_IFACE" udp dport { 53, 443 } accept
+    iifname "$PORTAL_HOST_IFACE" tcp dport { 53, 80, 443 } accept
+    iifname "$PORTAL_HOST_IFACE" reject with icmpx type admin-prohibited
+    oifname "$PORTAL_HOST_IFACE" ct state established,related accept
+    oifname "$PORTAL_HOST_IFACE" reject with icmpx type admin-prohibited
     oifname "$iface" accept
     oifname "tailscale0" accept
     ip daddr { 0.0.0.0/8, 10.0.0.0/8, 100.64.0.0/10, 127.0.0.0/8, 169.254.0.0/16, 172.16.0.0/12, 192.168.0.0/16, 224.0.0.0/4, 255.255.255.255/32 } accept
@@ -190,12 +202,13 @@ EOF
 
 enable_rules() {
   local iface="$1" conf ep parsed host port mark ep4 ep6 ep4_first ep6_first
-  local cached_host cached_port cached4 cached6 tmp endpoint_rules4 endpoint_rules6 table_prelude unresolved=0
+  local cache_file cache_label cached_host cached_port cached4 cached6 tmp endpoint_rules4 endpoint_rules6 table_prelude
+  local unresolved=0 used_portal_candidate=0
   valid_iface "$iface" || { echo "Invalid interface: $iface" >&2; exit 2; }
   conf="$(conf_for_iface "$iface")"
   [[ -f "$conf" ]] || { echo "Missing WireGuard config: $conf" >&2; exit 2; }
 
-  ep="$(endpoint_from_wg_or_conf "$iface" || true)"
+  ep="$(endpoint_from_conf_or_wg "$iface" || true)"
   if [[ -n "$ep" ]]; then
     parsed="$(parse_endpoint "$ep" || true)"
   else
@@ -212,23 +225,49 @@ enable_rules() {
   mark="$(wg_mark "$iface")"
   ep4=""
   ep6=""
-  if [[ -n "$host" ]]; then
+
+  # During the atomic post-portal restore, a matching runtime candidate must
+  # win over any still-untrusted underlay DNS answer. Its persistence remains
+  # deferred until the outer orchestrator verifies real WG-routed traffic.
+  if [[ "${WIREGUARD_PORTAL_RESTORE:-0}" == "1" && -r "$PORTAL_CANDIDATE_STATE_FILE" ]]; then
+    cached_host="$(state_value "$PORTAL_CANDIDATE_STATE_FILE" ENDPOINT_HOST)"
+    cached_port="$(state_value "$PORTAL_CANDIDATE_STATE_FILE" ENDPOINT_PORT)"
+    if [[ -n "$host" && "$host" == "$cached_host" && "$port" == "$cached_port" ]]; then
+      ep4="$(state_value "$PORTAL_CANDIDATE_STATE_FILE" ENDPOINT4)"
+      ep6="$(state_value "$PORTAL_CANDIDATE_STATE_FILE" ENDPOINT6)"
+      used_portal_candidate=1
+      log "using portal candidate for atomic protected restore: ${host}:${port}"
+    fi
+  fi
+
+  if [[ -z "$ep4" && -z "$ep6" && -n "$host" ]]; then
     ep4="$(resolve_endpoint_ips "$host" 4 | csv_or_empty || true)"
     ep6="$(resolve_endpoint_ips "$host" 6 | csv_or_empty || true)"
   fi
 
-  # DNS may be unavailable during very early boot. Reuse only a root-owned
-  # endpoint cache that matches the current config's host and port.
-  if [[ -z "$ep4" && -z "$ep6" && -r "$PERSISTENT_ENDPOINT_STATE_FILE" ]]; then
-    cached_host="$(state_value "$PERSISTENT_ENDPOINT_STATE_FILE" ENDPOINT_HOST)"
-    cached_port="$(state_value "$PERSISTENT_ENDPOINT_STATE_FILE" ENDPOINT_PORT)"
-    if [[ -n "$host" && "$host" == "$cached_host" && "$port" == "$cached_port" ]]; then
-      cached4="$(state_value "$PERSISTENT_ENDPOINT_STATE_FILE" ENDPOINT4)"
-      cached6="$(state_value "$PERSISTENT_ENDPOINT_STATE_FILE" ENDPOINT6)"
-      ep4="$cached4"
-      ep6="$cached6"
-      log "using persistent endpoint cache for early-boot guard: ${host}:${port}"
-    fi
+  # DNS may be unavailable during early boot or immediately after portal login.
+  # Prefer a root-owned runtime portal candidate, then the last verified
+  # persistent cache. Both must match the configured host and port.
+  if [[ -z "$ep4" && -z "$ep6" ]]; then
+    for cache_file in "$PORTAL_CANDIDATE_STATE_FILE" "$PERSISTENT_ENDPOINT_STATE_FILE"; do
+      [[ -r "$cache_file" ]] || continue
+      cached_host="$(state_value "$cache_file" ENDPOINT_HOST)"
+      cached_port="$(state_value "$cache_file" ENDPOINT_PORT)"
+      if [[ -n "$host" && "$host" == "$cached_host" && "$port" == "$cached_port" ]]; then
+        cached4="$(state_value "$cache_file" ENDPOINT4)"
+        cached6="$(state_value "$cache_file" ENDPOINT6)"
+        ep4="$cached4"
+        ep6="$cached6"
+        if [[ "$cache_file" == "$PORTAL_CANDIDATE_STATE_FILE" ]]; then
+          cache_label="portal candidate"
+          used_portal_candidate=1
+        else
+          cache_label="persistent endpoint cache"
+        fi
+        log "using $cache_label for protected bootstrap: ${host}:${port}"
+        break
+      fi
+    done
   fi
 
   endpoint_rules4=""
@@ -288,6 +327,11 @@ $endpoint_rules6
 
   chain forward {
     type filter hook forward priority filter; policy drop;
+    iifname "$PORTAL_HOST_IFACE" udp dport { 53, 443 } accept comment "isolated portal DNS and QUIC"
+    iifname "$PORTAL_HOST_IFACE" tcp dport { 53, 80, 443 } accept comment "isolated portal DNS and web"
+    iifname "$PORTAL_HOST_IFACE" reject with icmpx type admin-prohibited comment "block non-web portal traffic"
+    oifname "$PORTAL_HOST_IFACE" ct state established,related accept comment "isolated portal replies"
+    oifname "$PORTAL_HOST_IFACE" reject with icmpx type admin-prohibited comment "block unsolicited portal ingress"
     oifname "$iface" accept comment "forward via WireGuard"
     oifname "tailscale0" accept comment "forward via Tailscale"
     ip daddr @private4 accept comment "forward to LAN/private/tailnet IPv4"
@@ -327,15 +371,19 @@ EOF
     return 1
   fi
 
-  install -d -m 0700 "$PERSISTENT_STATE_DIR"
-  cp "$ENDPOINT_STATE_FILE" "$PERSISTENT_ENDPOINT_STATE_FILE"
-  chmod 0600 "$PERSISTENT_ENDPOINT_STATE_FILE"
+  if (( used_portal_candidate )); then
+    log "enabled with unverified portal endpoint candidate; deferring persistent cache promotion"
+  else
+    install -d -m 0700 "$PERSISTENT_STATE_DIR"
+    cp "$ENDPOINT_STATE_FILE" "$PERSISTENT_ENDPOINT_STATE_FILE"
+    chmod 0600 "$PERSISTENT_ENDPOINT_STATE_FILE"
+  fi
   log "enabled and verified iface=$iface endpoint=${host}:${port} ep4=${ep4:-none} ep6=${ep6:-none} mark=$mark"
 }
 
 disable_rules() {
   nft delete table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null || true
-  rm -f "$STATE_FILE" "$ROLLBACK_TOKEN_FILE" "$ENDPOINT_STATE_FILE"
+  rm -f "$STATE_FILE" "$ROLLBACK_TOKEN_FILE" "$ENDPOINT_STATE_FILE" "$PORTAL_CANDIDATE_STATE_FILE"
   log "disabled"
 }
 
@@ -343,22 +391,36 @@ has_table() {
   nft list table "$TABLE_FAMILY" "$TABLE_NAME" >/dev/null 2>&1
 }
 
-verify_rules() {
+verify_portal_rules() {
   local rules
   [[ -f "$STATE_FILE" ]] || return 1
   rules="$(nft list table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null)" || return 1
   grep -q 'hook output.*policy drop' <<<"$rules" || return 1
   grep -q 'hook forward.*policy drop' <<<"$rules" || return 1
+  grep -q "iifname \"$PORTAL_HOST_IFACE\".*dport.*53.*443.*accept" <<<"$rules" || return 1
+  grep -q "iifname \"$PORTAL_HOST_IFACE\".*dport.*53.*80.*443.*accept" <<<"$rules" || return 1
+  grep -q "iifname \"$PORTAL_HOST_IFACE\".*reject" <<<"$rules" || return 1
+  grep -q "oifname \"$PORTAL_HOST_IFACE\".*state established,related.*accept" <<<"$rules" || return 1
+  grep -q "oifname \"$PORTAL_HOST_IFACE\".*reject" <<<"$rules" || return 1
+  grep -q 'block public non-WireGuard egress\|emergency block public non-WireGuard egress' <<<"$rules" || return 1
+}
+
+verify_rules() {
+  local rules
+  verify_portal_rules || return 1
+  rules="$(nft list table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null)" || return 1
   grep -q 'WireGuard endpoint IPv' <<<"$rules" || return 1
-  grep -q 'block public non-WireGuard egress' <<<"$rules" || return 1
 }
 
 status_rules() {
-  local iface=""
+  local mode="${1:-full}" iface=""
   [[ -f "$STATE_FILE" ]] && iface="$(cat "$STATE_FILE" 2>/dev/null || true)"
-  if verify_rules; then
+  if [[ "$mode" == "portal" ]] && verify_portal_rules; then
+    echo "portal-ready verified iface=${iface:-unknown}"
+    nft list table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null | sed -n '1,140p'
+  elif [[ "$mode" == "full" ]] && verify_rules; then
     echo "enabled verified iface=${iface:-unknown}"
-    nft list table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null | sed -n '1,120p'
+    nft list table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null | sed -n '1,140p'
   elif has_table; then
     echo "blocked-unready iface=${iface:-unknown}"
     return 1
@@ -408,7 +470,10 @@ main() {
       disable_rules
       ;;
     status)
-      status_rules
+      status_rules full
+      ;;
+    status-portal)
+      status_rules portal
       ;;
     *)
       usage

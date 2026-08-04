@@ -6,10 +6,13 @@ PRIVILEGED_HELPER ?= /usr/local/bin/wireguard-reconnect
 PKEXEC ?= pkexec
 CURL ?= curl
 CHECK_URL ?= https://example.com
+DOMAIN ?=
+PORTAL_SIMULATOR ?= ./tests/simulate-captive-portal.sh
+PORTAL_CONTAINER_SIMULATOR ?= ./tests/simulate-captive-portal-container.sh
 INTENT_STATE ?= /run/wireguard-reconnect.enabled
 KILLSWITCH_STATE ?= /run/wg-killswitch.enabled
 
-.PHONY: help status toggle connect disconnect reconnect reset logs diagnostics test install
+.PHONY: help status toggle connect disconnect reconnect reset portal portal-simulate portal-container-simulate logs diagnostics test install
 
 help:
 	@printf '%s\n' \
@@ -19,7 +22,13 @@ help:
 	  '  make disconnect   Explicit intentional disconnect' \
 	  '  make connect      Explicitly connect WireGuard' \
 	  '  make reconnect    Bounce and reconnect WireGuard' \
-	  '  make reset        Clear VPN intent and the leak-protection guard' \
+	  '  make reset        Emergency full bypass: disable VPN intent and leak protection' \
+	  '' \
+	  'Captive portal:' \
+	  '  make portal                 Detect, isolate login, and restore VPN automatically' \
+	  '  make portal DOMAIN=x        Start the isolated browser at a known portal domain' \
+	  '  make portal-simulate        Run a local no-root captive-portal simulation' \
+	  '  make portal-container-simulate  Run the fake portal in Docker on loopback' \
 	  '' \
 	  'Troubleshooting:' \
 	  '  make logs         Show recent service and helper logs' \
@@ -41,6 +50,15 @@ disconnect:
 
 reconnect:
 	@$(STATUS_SCRIPT) reconnect
+
+portal:
+	@$(PKEXEC) $(PRIVILEGED_HELPER) portal $(INTERFACE) "$(DOMAIN)"
+
+portal-simulate:
+	@$(PORTAL_SIMULATOR)
+
+portal-container-simulate:
+	@$(PORTAL_CONTAINER_SIMULATOR)
 
 # Recovery for a missing/stale wg0 that left the fail-closed guard armed.
 # Older installed helpers return non-zero when wg0 is already absent, even
@@ -68,11 +86,14 @@ logs:
 	  -t wg-killswitch \
 	  -t wireguard-reconnect \
 	  -t wireguard-monitor \
+	  -t wireguard-portal \
 	  -b --no-pager -n 200
 	@printf '\n-- /run/wireguard-reconnect.log --\n'
 	@tail -n 50 /run/wireguard-reconnect.log 2>/dev/null || true
 	@printf '\n-- /run/wireguard-reconnect.failure --\n'
 	@cat /run/wireguard-reconnect.failure 2>/dev/null || true
+	@printf '\n-- /run/wireguard-portal.log --\n'
+	@tail -n 100 /run/wireguard-portal.log 2>/dev/null || true
 
 diagnostics:
 	@printf '%s\n' '-- status --'
@@ -91,12 +112,15 @@ diagnostics:
 	@[[ -e /run/wireguard-reconnect.enabled ]] && cat /run/wireguard-reconnect.enabled || echo off
 	@printf '%s\n' '-- leak-protection guard --'
 	@[[ -e /run/wg-killswitch.enabled ]] && cat /run/wg-killswitch.enabled || echo off
+	@printf '%s\n' '-- captive portal transaction --'
+	@[[ -e /run/wireguard-portal.active ]] && cat /run/wireguard-portal.active || echo inactive
 
 test:
 	@./tests/test-killswitch.sh
 	@./tests/test-autostart.sh
 	@./tests/test-status.sh
 	@./tests/test-make-controls.sh
+	@./tests/test-portal.sh
 	@./tests/test-version.sh
 
 install:

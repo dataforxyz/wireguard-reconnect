@@ -40,11 +40,24 @@ chmod +x "$TMP/bin/"*
 export PATH="$TMP/bin:/usr/bin:/bin"
 export STATUS_CALL_LOG="$TMP/run/calls"
 export WIREGUARD_RECONNECT_HELPER="$TMP/bin/helper"
+export WIREGUARD_PORTAL_STATE="$TMP/run/portal.active"
 export XDG_RUNTIME_DIR="$TMP/run"
 
 "$REPO_DIR/wireguard-status" disconnect
 
 grep -Fxq "$TMP/bin/helper down wg0" "$STATUS_CALL_LOG"
-! grep -Eq 'Left-click|Right-click|left-click|right-click' "$REPO_DIR/wireguard-status"
+
+touch "$WIREGUARD_PORTAL_STATE"
+portal_status="$("$REPO_DIR/wireguard-status")"
+grep -Fq '"class": "portal"' <<<"$portal_status"
+grep -Fq 'Normal host traffic remains blocked' <<<"$portal_status"
+: >"$STATUS_CALL_LOG"
+"$REPO_DIR/wireguard-status" toggle
+test ! -s "$STATUS_CALL_LOG"
+
+if grep -Eq 'Left-click|Right-click|left-click|right-click' "$REPO_DIR/wireguard-status"; then
+  echo "unsafe click instruction remains in wireguard-status" >&2
+  exit 1
+fi
 grep -q 'Middle-click' "$REPO_DIR/wireguard-status"
-printf 'status missing-interface disconnect and safe-click tests: OK\n'
+printf 'status disconnect, portal isolation, and safe-click tests: OK\n'

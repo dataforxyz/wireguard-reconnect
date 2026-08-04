@@ -11,6 +11,7 @@ WAYBAR_SIGNAL="${WAYBAR_WIREGUARD_SIGNAL:-RTMIN+10}"
 # only read it for tooltips/error messages.
 LOG_FILE="/run/wireguard-reconnect.log"
 FAILURE_STATE="/run/wireguard-reconnect.failure"
+PORTAL_STATE="${WIREGUARD_PORTAL_STATE:-/run/wireguard-portal.active}"
 RECONNECT_HELPER="${WIREGUARD_RECONNECT_HELPER:-/usr/local/bin/wireguard-reconnect}"
 # Self-heal: when the interface is up but offline, attempt a hands-free
 # reconnect straight from the Waybar poll instead of waiting for a manual click.
@@ -178,6 +179,11 @@ run_wg_action() {
 toggle() {
     local active_iface wg_action target_interface rc
 
+    if [ -f "$PORTAL_STATE" ]; then
+        notify "VPN" "Captive portal login is active; VPN controls are temporarily locked"
+        exit 0
+    fi
+
     active_iface="$(active_interface 2>/dev/null || true)"
     if [ -n "$active_iface" ]; then
         target_interface="$active_iface"
@@ -281,14 +287,14 @@ wake_monitor() {
 
         if [ "$attempt" -eq 1 ]; then
             notify -u normal "VPN waiting for network login" \
-                "Captive portal or Wi-Fi not ready. Finish portal login; WireGuard will retry for $((WAKE_ATTEMPTS * WAKE_INTERVAL / 60)) min."
+                "Captive portal or Wi-Fi not ready. Run 'make portal' from wireguard-reconnect for an isolated login."
         fi
 
         sleep "$WAKE_INTERVAL"
     done
 
     refresh_waybar
-    notify -u critical "VPN still offline" "Captive portal may still be blocking WireGuard. Run 'make reset' from wireguard-reconnect, finish login, then middle-click the VPN icon to reconnect."
+    notify -u critical "VPN still offline" "Captive portal may be blocking WireGuard. Run 'make portal' from wireguard-reconnect for an isolated login and automatic protected reconnect."
 }
 
 wake() {
@@ -337,6 +343,12 @@ auto_reconnect() {
 
 status() {
     local iface tooltip gap
+    if [ -f "$PORTAL_STATE" ]; then
+        reset_stale_count
+        tooltip="VPN: Captive portal login isolated\\nNormal host traffic remains blocked by leak protection\\nThe ephemeral portal browser will close automatically after login"
+        echo "{\"text\": \"󰖂\", \"class\": \"portal\", \"tooltip\": \"${tooltip}\"}"
+        return 0
+    fi
     iface="$(active_interface 2>/dev/null || true)"
     # Always refresh the poll timestamp; a large gap means we were asleep/frozen
     # and should reconnect now rather than waiting out the consecutive counter.
@@ -348,7 +360,7 @@ status() {
             tooltip="VPN: Online (${iface})\\nConnectivity check passed through WireGuard\\nMiddle-click to disconnect"
             echo "{\"text\": \"󰖂\", \"class\": \"connected\", \"tooltip\": \"${tooltip}\"}"
         else
-            tooltip="VPN: Enabled but offline (${iface})\\n$(failure_message)\\nKill switch should block public fallback traffic\\nWill auto-reconnect after ${AUTORECONNECT_STALE_THRESHOLD} consecutive stale checks (sooner after sleep)\\nMiddle-click to reconnect; use 'make reset' for portal login"
+            tooltip="VPN: Enabled but offline (${iface})\\n$(failure_message)\\nKill switch should block public fallback traffic\\nWill auto-reconnect after ${AUTORECONNECT_STALE_THRESHOLD} consecutive stale checks (sooner after sleep)\\nMiddle-click to reconnect; use 'make portal' for isolated login"
             echo "{\"text\": \"󰖂\", \"class\": \"stale\", \"tooltip\": \"${tooltip}\"}"
             # Do not bounce wg0 on one missed curl; require consecutive stale
             # polls so transient packet loss/DNS/check-server slowness doesn't

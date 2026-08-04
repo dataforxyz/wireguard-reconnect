@@ -3,7 +3,7 @@
 Event-driven WireGuard recovery for a Linux laptop using iwd/systemd-networkd,
 with Waybar controls, a full-tunnel kill switch, and Tailscale route repair.
 
-Current release: **v1.0.1**
+Current release: **v1.1.0**
 
 ## Behavior
 
@@ -25,10 +25,17 @@ Current release: **v1.0.1**
   `wg0` is brought up, remains active while `wg0` is bounced, and is verified
   again afterward. A failed verification takes `wg0` down and leaves public
   traffic blocked.
+- **Captive portals without host leaks:** detects portal interception from a
+  dedicated network namespace, opens an ephemeral Chromium profile inside that
+  namespace, and allows only its DNS and web traffic over the Wi-Fi underlay.
+  Every normal host process remains blocked by the kill switch. After the portal
+  returns the expected HTTP 204, the namespace is destroyed and WireGuard is
+  restored and verified automatically.
 
 ## Files
 
 - `wireguard-reconnect` — root-owned, fixed-action helper used through `pkexec`
+- `wireguard-portal` — isolated captive-portal namespace/browser orchestrator
 - `wg-killswitch` — nftables full-tunnel kill switch
 - `wireguard-status` — Waybar JSON status/toggle/autoreconnect command
 - `wireguard-monitor` — event-driven physical-network monitor
@@ -84,8 +91,79 @@ make toggle       # same as middle-clicking the icon
 make disconnect   # explicit intentional disconnect
 make connect      # explicitly connect wg0
 make reconnect    # explicitly bounce and reconnect wg0
-make reset        # clear stuck VPN intent and leak protection, even if wg0 is missing
+make reset        # EMERGENCY full bypass; disables leak protection
 ```
+
+### Captive portals
+
+Use one command:
+
+```bash
+make portal
+```
+
+It performs the entire transaction automatically:
+
+1. acquires a portal lock honored by every connect, disconnect, and reconnect
+   action, then verifies the host-wide fail-closed nftables guard;
+2. takes `wg0` down without removing that guard;
+3. creates a root-owned network namespace and veth pair, enabling and recording
+   only the two required per-interface forwarding knobs without changing the
+   host's global IPv4 router mode; when the physical interface was already
+   forwarding, existing Docker/libvirt/Tailscale routed flows are preserved;
+4. permits only DNS, HTTP, HTTPS, and QUIC from that namespace and rejects
+   namespace-originated access to services on the host itself;
+5. probes independent Google and Cloudflare plain-HTTP 204 endpoints so one
+   allow-listed detector cannot create a false "open internet" result;
+6. when interception is detected, opens an isolated Chromium-family browser
+   with a new temporary profile inside the namespace;
+7. polls until the connectivity endpoint returns HTTP 204;
+8. resolves the WireGuard endpoint from the authenticated isolated namespace
+   and stages it as a runtime-only candidate so protected bootstrap does not
+   depend on still-blocked host DNS; the persistent cache is updated only after
+   real traffic through WireGuard is verified;
+9. closes the browser and verifies destruction of its profile, namespace, NAT
+   table, and veth before clearing portal state, restoring the two prior
+   per-interface forwarding settings, or permitting any other VPN action;
+10. reconnects WireGuard and verifies both the `wg0` route and real HTTP traffic.
+
+No regular host process receives direct underlay access. The browser has no
+normal profile, cookies, extensions, password manager, or sync state. Closing
+it early, pressing Ctrl-C, timing out, or encountering an error triggers cleanup
+and an attempted protected reconnect; if reconnect fails, the host remains
+fail-closed.
+
+A known starting domain is optional:
+
+```bash
+make portal DOMAIN=wifi.example.com
+make portal DOMAIN=http://wifi.example.com/login
+```
+
+This only chooses the isolated browser's starting page; it does not create a
+host-wide domain exception.
+
+A no-root local simulation is included:
+
+```bash
+make portal-simulate
+```
+
+A Docker-backed variant runs the fake portal in an isolated container bound only
+to a random loopback port, exercises the same detector state machine, removes
+the container and its locally tagged test image, and runs the rootless kernel
+namespace/firewall test:
+
+```bash
+make portal-container-simulate
+```
+
+The regular simulator starts a loopback HTTP server that initially redirects like a
+captive portal, accepts a simulated login, then changes the detector response to
+204. It also uses an unprivileged throwaway user/network namespace (when the
+kernel permits one) to prove that portal HTTP succeeds while a non-web port and
+a service on the host-side veth remain blocked. It never touches live
+WireGuard, the host nftables ruleset, or the real network interfaces.
 
 Troubleshooting and maintenance commands are also available:
 
@@ -96,10 +174,9 @@ make test
 make install      # sudo install/update of the system integration
 ```
 
-`make reset` is the captive-portal/emergency escape hatch. It intentionally
-leaves WireGuard off, disables the fail-closed guard, and verifies that direct
-internet traffic is available. Re-enable the VPN afterward with `make connect`
-or middle-clicking the Waybar icon.
+`make reset` remains an emergency full bypass for repairing a broken ruleset.
+It is not used by captive-portal mode and intentionally removes leak protection;
+prefer `make portal` whenever the network requires browser authentication.
 
 Check the installed version with:
 
@@ -144,13 +221,15 @@ Environment variables may be supplied through systemd service drop-ins:
 ```bash
 systemctl status wireguard-killswitch.service wireguard-monitor.service wireguard-autostart.service
 journalctl -u wireguard-killswitch.service -u wireguard-monitor.service -u wireguard-autostart.service -b
-journalctl -t wg-killswitch -t wireguard-reconnect -t wireguard-monitor -b
+journalctl -t wg-killswitch -t wireguard-reconnect -t wireguard-monitor -t wireguard-portal -b
 wireguard-status
 ```
 
 The latest privileged helper output is written to
 `/run/wireguard-reconnect.log`. Critical fail-closed state is also written to
-`/run/wireguard-reconnect.failure` and shown in the Waybar tooltip.
+`/run/wireguard-reconnect.failure` and shown in the Waybar tooltip. Captive
+portal activity is written to `/run/wireguard-portal.log`, with active
+transaction metadata in `/run/wireguard-portal.active`.
 
 Run the unprivileged nftables-generation regression test with:
 
@@ -159,6 +238,9 @@ Run the unprivileged nftables-generation regression test with:
 ./tests/test-autostart.sh
 ./tests/test-status.sh
 ./tests/test-make-controls.sh
+./tests/test-portal.sh
+./tests/test-portal-netns.sh  # also run by the portal simulator when supported
+./tests/simulate-captive-portal-container.sh  # optional; requires Docker
 ./tests/test-version.sh
 ```
 
@@ -174,8 +256,11 @@ blocking guard installed while returning non-zero so WireGuard stays down.
 ## Kill-switch exceptions
 
 When enabled, public IPv4 and IPv6 egress is rejected unless it uses `wg0`.
-Explicit exceptions are limited to loopback, LAN/private destinations, DHCP,
-the configured WireGuard UDP endpoint, Tailscale's marked encrypted underlay,
-`tailscale0`, and local Docker/bridge interfaces. An intentional Waybar
-**disconnect** removes the guard so captive portals and direct troubleshooting
-work; the next system boot restores the default-on guarded policy.
+Explicit host exceptions are limited to loopback, LAN/private destinations,
+DHCP, the configured WireGuard UDP endpoint, Tailscale's marked encrypted
+underlay, `tailscale0`, and local Docker/bridge interfaces. During captive-portal
+mode, forwarded traffic from the root-created `wgportal0` veth is additionally
+limited to DNS and web ports; all other traffic from that namespace is rejected
+before the normal private/LAN forwarding exception. An intentional emergency
+**disconnect/reset** still removes the guard completely; the next system boot
+restores the default-on guarded policy.

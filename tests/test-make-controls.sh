@@ -11,9 +11,12 @@ touch "$TMP/run/intent" "$TMP/run/guard"
 cat >"$TMP/pkexec" <<'EOF'
 #!/bin/bash
 printf '%s\n' "$*" >"$MAKE_CONTROL_CALL_LOG"
-rm -f "$MAKE_CONTROL_INTENT_STATE" "$MAKE_CONTROL_KILLSWITCH_STATE"
-# Match the old helper's harmless non-zero result when wg0 was already absent.
-exit 1
+if [ "${2:-}" = "down" ]; then
+  rm -f "$MAKE_CONTROL_INTENT_STATE" "$MAKE_CONTROL_KILLSWITCH_STATE"
+  # Match the old helper's harmless non-zero result when wg0 was already absent.
+  exit 1
+fi
+exit 0
 EOF
 
 cat >"$TMP/curl" <<'EOF'
@@ -41,4 +44,10 @@ grep -Fq 'Direct internet connectivity check passed' <<<"$output"
 test ! -e "$MAKE_CONTROL_INTENT_STATE"
 test ! -e "$MAKE_CONTROL_KILLSWITCH_STATE"
 
-printf 'make reset recovery test: OK\n'
+make -s -C "$REPO_DIR" portal \
+  PKEXEC="$TMP/pkexec" \
+  PRIVILEGED_HELPER=/mock/wireguard-reconnect \
+  DOMAIN=http://hotel.portal.test/login
+grep -Fxq '/mock/wireguard-reconnect portal wg0 http://hotel.portal.test/login' "$MAKE_CONTROL_CALL_LOG"
+
+printf 'make reset and one-command portal dispatch tests: OK\n'

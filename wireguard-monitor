@@ -18,6 +18,7 @@ KILLSWITCH_STATE="${WIREGUARD_KILLSWITCH_STATE:-/run/wg-killswitch.enabled}"
 RECONNECT_HELPER="${WIREGUARD_RECONNECT_HELPER:-/usr/local/bin/wireguard-reconnect}"
 KILLSWITCH_HELPER="${WIREGUARD_KILLSWITCH_HELPER:-/usr/local/bin/wg-killswitch}"
 FAILURE_STATE="${WIREGUARD_FAILURE_STATE:-/run/wireguard-reconnect.failure}"
+PORTAL_STATE="${WIREGUARD_PORTAL_STATE:-/run/wireguard-portal.active}"
 ACTION_LOCK="${WIREGUARD_MONITOR_LOCK:-/run/wireguard-monitor-action.lock}"
 RECONNECT_LOCK="${WIREGUARD_RECONNECT_LOCK:-/run/wireguard-reconnect.lock}"
 GUARD_CHECK_INTERVAL="${WIREGUARD_GUARD_CHECK_INTERVAL:-15}"
@@ -52,10 +53,15 @@ repair_if_needed() {
     exec 9>"$ACTION_LOCK"
     flock -n 9 || return 0
 
+    # Portal mode owns the underlay transition. The host kill switch remains
+    # armed while only the isolated namespace can reach portal DNS/web ports.
+    [ -f "$PORTAL_STATE" ] && return 0
     vpn_intended_on || return 0
     underlay_online || return 0
 
     sleep "$STABILIZE_DELAY"
+    # Portal mode may have started during stabilization after the first check.
+    [ -f "$PORTAL_STATE" ] && return 0
     underlay_online || return 0
 
     if vpn_online; then
@@ -97,17 +103,18 @@ guard_watchdog() {
         # Sharing the privileged helper's lock prevents re-arming the guard in
         # the middle of an intentional disconnect.
         (
-            local message
+            local message status_action="status"
             exec 8>"$RECONNECT_LOCK"
             flock -n 8 || exit 0
 
-            if "$KILLSWITCH_HELPER" status >/dev/null 2>&1; then
+            [ -f "$PORTAL_STATE" ] && status_action="status-portal"
+            if "$KILLSWITCH_HELPER" "$status_action" >/dev/null 2>&1; then
                 exit 0
             fi
 
             log "CRITICAL: kill-switch verification failed; attempting immediate repair"
-            if /usr/bin/timeout 15s "$KILLSWITCH_HELPER" enable "$IFACE" >/dev/null 2>&1 && \
-                "$KILLSWITCH_HELPER" status >/dev/null 2>&1; then
+            /usr/bin/timeout 15s "$KILLSWITCH_HELPER" enable "$IFACE" >/dev/null 2>&1 || true
+            if "$KILLSWITCH_HELPER" "$status_action" >/dev/null 2>&1; then
                 log "kill-switch watchdog restored verified protection"
                 if [ -r "$FAILURE_STATE" ] && grep -q '^Kill-switch watchdog:' "$FAILURE_STATE"; then
                     rm -f "$FAILURE_STATE"
