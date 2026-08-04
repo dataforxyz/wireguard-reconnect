@@ -31,6 +31,7 @@ fi
 grep -Fq 'cp.cloudflare.com/generate_204' "$REPO_DIR/wireguard-portal"
 grep -Fq 'physical network changed during portal login' "$REPO_DIR/wireguard-portal"
 grep -Fq 'install -m 0600 /dev/null /etc/wireguard-reconnect/portal-user' "$REPO_DIR/install.sh"
+grep -Fq 'systemctl restart wireguard-monitor.service' "$REPO_DIR/install.sh"
 grep -Fq 'portal_resources_present' "$REPO_DIR/wireguard-portal"
 # shellcheck disable=SC2016 # Assert literal production-script source text.
 grep -Fq 'physical interface $PHYSICAL_IFACE disappeared' "$REPO_DIR/wireguard-portal"

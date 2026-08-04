@@ -3,7 +3,7 @@
 Event-driven WireGuard recovery for a Linux laptop using iwd/systemd-networkd,
 with Waybar controls, a full-tunnel kill switch, and Tailscale route repair.
 
-Current release: **v1.2.0**
+Current release: **v1.2.1**
 
 ## Behavior
 

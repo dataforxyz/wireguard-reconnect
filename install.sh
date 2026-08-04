@@ -107,7 +107,11 @@ fi
 /usr/local/bin/wg-killswitch status >/dev/null
 
 systemctl enable --now wireguard-killswitch.service
-systemctl enable --now wireguard-monitor.service
+systemctl enable wireguard-monitor.service
+# `enable --now` does not restart an already-running monitor during upgrades.
+# Restart explicitly so the live event loop always executes the just-installed
+# automatic portal and concurrency logic.
+systemctl restart wireguard-monitor.service
 systemctl enable wireguard-autostart.service
 systemctl restart wireguard-autostart.service
 

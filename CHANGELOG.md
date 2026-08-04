@@ -3,6 +3,14 @@
 All notable changes to this project are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] - 2026-08-04
+
+### Fixed
+
+- Restart the persistent network monitor during upgrades instead of relying on
+  `systemctl enable --now`, which leaves an already-running older event loop in
+  memory after new automatic captive-portal logic is installed.
+
 ## [1.2.0] - 2026-08-04
 
 ### Added
@@ -99,6 +107,7 @@ All notable changes to this project are documented here. The project follows
 - Critical failures are recorded in `/run/wireguard-reconnect.failure` and
   surfaced in the Waybar tooltip.
 
+[1.2.1]: https://github.com/dataforxyz/wireguard-reconnect/releases/tag/v1.2.1
 [1.2.0]: https://github.com/dataforxyz/wireguard-reconnect/releases/tag/v1.2.0
 [1.1.0]: https://github.com/dataforxyz/wireguard-reconnect/releases/tag/v1.1.0
 [1.0.1]: https://github.com/dataforxyz/wireguard-reconnect/releases/tag/v1.0.1
