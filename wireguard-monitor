@@ -19,9 +19,20 @@ RECONNECT_HELPER="${WIREGUARD_RECONNECT_HELPER:-/usr/local/bin/wireguard-reconne
 KILLSWITCH_HELPER="${WIREGUARD_KILLSWITCH_HELPER:-/usr/local/bin/wg-killswitch}"
 FAILURE_STATE="${WIREGUARD_FAILURE_STATE:-/run/wireguard-reconnect.failure}"
 PORTAL_STATE="${WIREGUARD_PORTAL_STATE:-/run/wireguard-portal.active}"
+AUTO_PORTAL="${WIREGUARD_AUTO_PORTAL:-1}"
+PORTAL_USER_FILE="${WIREGUARD_PORTAL_USER_FILE:-/etc/wireguard-reconnect/portal-user}"
+PORTAL_COOLDOWN="${WIREGUARD_PORTAL_COOLDOWN:-300}"
+PORTAL_GLOBAL_COOLDOWN="${WIREGUARD_PORTAL_GLOBAL_COOLDOWN:-30}"
+PORTAL_STAMP="${WIREGUARD_PORTAL_STAMP:-/run/wireguard-portal.autodetect}"
+IW_BIN="${WIREGUARD_IW_BIN:-/usr/bin/iw}"
+LOGINCTL_BIN="${WIREGUARD_LOGINCTL_BIN:-/usr/bin/loginctl}"
+SYS_CLASS_NET="${WIREGUARD_SYS_CLASS_NET:-/sys/class/net}"
+USER_RUNTIME_ROOT="${WIREGUARD_USER_RUNTIME_ROOT:-/run/user}"
 ACTION_LOCK="${WIREGUARD_MONITOR_LOCK:-/run/wireguard-monitor-action.lock}"
 RECONNECT_LOCK="${WIREGUARD_RECONNECT_LOCK:-/run/wireguard-reconnect.lock}"
 GUARD_CHECK_INTERVAL="${WIREGUARD_GUARD_CHECK_INTERVAL:-15}"
+[[ "$PORTAL_COOLDOWN" =~ ^[0-9]+$ ]] || PORTAL_COOLDOWN=300
+[[ "$PORTAL_GLOBAL_COOLDOWN" =~ ^[0-9]+$ ]] || PORTAL_GLOBAL_COOLDOWN=30
 LAST_TRIGGER=0
 
 log() {
@@ -46,6 +57,102 @@ vpn_online() {
         --output /dev/null --write-out '%{http_code}' "$CHECK_URL" 2>/dev/null || true)"
     [ "$code" = "204" ] || [ "$code" = "200" ]
 }
+
+physical_default_interface() {
+    ip -4 route show table main default 2>/dev/null | awk '
+        $0 !~ / dev (wg[0-9]*|tailscale[0-9]*|tun[0-9]*|tap[0-9]*)/ {
+            for (i=1; i<=NF; i++) if ($i == "dev") { print $(i+1); exit }
+        }
+    '
+}
+
+wifi_fingerprint() {
+    local physical="$1" bssid
+    [ -d "$SYS_CLASS_NET/$physical/wireless" ] || return 1
+    bssid="$($IW_BIN dev "$physical" link 2>/dev/null | awk '/^Connected to / {print $3; exit}' || true)"
+    [ -n "$bssid" ] || return 1
+    printf '%s|%s\n' "$physical" "$bssid"
+}
+
+active_local_graphical_session() {
+    local uid="$1" session active remote class type
+    while IFS= read -r session; do
+        [ -n "$session" ] || continue
+        active="$($LOGINCTL_BIN show-session "$session" -p Active --value 2>/dev/null || true)"
+        remote="$($LOGINCTL_BIN show-session "$session" -p Remote --value 2>/dev/null || true)"
+        class="$($LOGINCTL_BIN show-session "$session" -p Class --value 2>/dev/null || true)"
+        type="$($LOGINCTL_BIN show-session "$session" -p Type --value 2>/dev/null || true)"
+        if [ "$active" = "yes" ] && [ "$remote" = "no" ] && [ "$class" = "user" ] && \
+           { [ "$type" = "wayland" ] || [ "$type" = "x11" ]; }; then
+            return 0
+        fi
+    done < <($LOGINCTL_BIN list-sessions --no-legend 2>/dev/null | awk -v uid="$uid" '$2 == uid {print $1}')
+    return 1
+}
+
+portal_user_uid() {
+    local uid
+    [ -r "$PORTAL_USER_FILE" ] || return 1
+    [ "$(stat -c '%u' "$PORTAL_USER_FILE" 2>/dev/null || true)" = "0" ] || return 1
+    find "$PORTAL_USER_FILE" -maxdepth 0 -uid 0 ! -perm /022 -print -quit 2>/dev/null | grep -q . || return 1
+    uid="$(head -n1 "$PORTAL_USER_FILE" 2>/dev/null || true)"
+    [[ "$uid" =~ ^[0-9]+$ ]] && [ "$uid" -ge 1000 ] || return 1
+    getent passwd "$uid" >/dev/null 2>&1 || return 1
+    active_local_graphical_session "$uid" || return 1
+    find "$USER_RUNTIME_ROOT/$uid" -maxdepth 1 -type s -name 'wayland-*' -print -quit 2>/dev/null | grep -q . || return 1
+    printf '%s\n' "$uid"
+}
+
+portal_cooldown_ready() (
+    local fingerprint="$1" now last_time=0 last_fingerprint=""
+    exec 7>"${PORTAL_STAMP}.lock"
+    flock -x 7
+    now="$(date +%s)"
+    if [ -r "$PORTAL_STAMP" ]; then
+        last_time="$(sed -n '1p' "$PORTAL_STAMP" 2>/dev/null || echo 0)"
+        last_fingerprint="$(sed -n '2p' "$PORTAL_STAMP" 2>/dev/null || true)"
+    fi
+    [[ "$last_time" =~ ^[0-9]+$ ]] || last_time=0
+    if (( now - last_time < PORTAL_GLOBAL_COOLDOWN )); then
+        return 1
+    fi
+    if [ "$fingerprint" = "$last_fingerprint" ] && (( now - last_time < PORTAL_COOLDOWN )); then
+        return 1
+    fi
+    printf '%s\n%s\n' "$now" "$fingerprint" >"$PORTAL_STAMP"
+    chmod 0644 "$PORTAL_STAMP" 2>/dev/null || true
+)
+
+maybe_auto_portal() (
+    local reason="${1:-network event}" action_lock_held="${2:-0}" physical fingerprint uid
+    [ "$AUTO_PORTAL" = "1" ] || return 1
+    if [ "$action_lock_held" != "1" ]; then
+        exec 6>"$ACTION_LOCK"
+        flock -n 6 || return 1
+    fi
+    # Also own the helper's action lock. Autostart, Waybar, or a manual helper
+    # call may reconnect without using the monitor lock.
+    exec 5>"$RECONNECT_LOCK"
+    flock -n 5 || return 1
+    [ -f "$PORTAL_STATE" ] && return 1
+    underlay_online || return 1
+    # Recheck after owning both locks. A reconnect may have completed between
+    # the watchdog's stale observation and this decision.
+    vpn_online && return 1
+    physical="$(physical_default_interface)"
+    [ -n "$physical" ] || return 1
+    fingerprint="$(wifi_fingerprint "$physical")" || return 1
+    uid="$(portal_user_uid)" || return 1
+    portal_cooldown_ready "$fingerprint" || return 1
+
+    log "$reason: WireGuard is still offline on Wi-Fi; starting isolated captive-portal detection"
+    if PKEXEC_UID="$uid" WIREGUARD_RECONNECT_LOCK_HELD=1 "$RECONNECT_HELPER" portal "$IFACE"; then
+        log "$reason: captive-portal transaction completed with protected connectivity"
+        return 0
+    fi
+    log "$reason: captive-portal transaction did not restore connectivity; host remains fail-closed"
+    return 1
+)
 
 repair_if_needed() {
     local reason="${1:-network event}" action
@@ -77,11 +184,20 @@ repair_if_needed() {
 
     log "$reason: $IFACE is stale or missing; running $action"
     if "$RECONNECT_HELPER" "$action" "$IFACE"; then
-        log "$reason: $IFACE $action completed"
+        sleep "$STABILIZE_DELAY"
+        if vpn_online; then
+            log "$reason: $IFACE $action completed and traffic is verified"
+            return 0
+        fi
+        log "$reason: $IFACE $action completed but traffic is still offline"
     else
-        log "$reason: $IFACE $action failed; a later network event will retry"
-        return 1
+        log "$reason: $IFACE $action failed"
     fi
+
+    maybe_auto_portal "$reason" 1 || {
+        log "$reason: automatic portal recovery did not complete; a later network event will retry"
+        return 1
+    }
 }
 
 trigger_repair() {
@@ -126,8 +242,20 @@ guard_watchdog() {
                 logger -p daemon.crit -t wireguard-monitor "$message" 2>/dev/null || true
             fi
         )
+
+        # A Wi-Fi portal may already be present before the desktop Wayland
+        # session exists. Re-evaluate periodically so login triggers automatic
+        # isolated detection without requiring another route/AP event.
+        if [ ! -f "$PORTAL_STATE" ] && vpn_intended_on && underlay_online && ! vpn_online; then
+            maybe_auto_portal "periodic Wi-Fi health check" || true
+        fi
     done
 }
+
+if [ "${1:-}" = "--auto-portal-once" ]; then
+    maybe_auto_portal "automatic portal test"
+    exit $?
+fi
 
 # A service restart after resume gets an immediate health check even if the
 # relevant netlink event happened just before the monitor started reading.

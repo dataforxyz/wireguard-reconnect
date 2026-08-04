@@ -32,6 +32,8 @@ CHECK_TIMEOUT=5
 POLL_INTERVAL=2
 PORTAL_TIMEOUT=600
 RECONNECT_HELPER="/usr/local/bin/wireguard-reconnect"
+IW_BIN="${WIREGUARD_IW_BIN:-/usr/bin/iw}"
+LOGINCTL_BIN="${WIREGUARD_LOGINCTL_BIN:-/usr/bin/loginctl}"
 BROWSER_PID=""
 PROFILE_DIR=""
 NETNS_READY=0
@@ -80,6 +82,29 @@ physical_interface() {
     '
 }
 
+network_fingerprint() {
+    local physical="$1" gateway bssid
+    gateway="$(ip -4 route show table main default dev "$physical" 2>/dev/null | awk '/default via / {print $3; exit}')"
+    bssid="$($IW_BIN dev "$physical" link 2>/dev/null | awk '/^Connected to / {print $3; exit}' || true)"
+    printf '%s|%s|%s\n' "$physical" "$gateway" "${bssid:-wired}"
+}
+
+active_local_graphical_session() {
+    local uid="$1" session active remote class type
+    while IFS= read -r session; do
+        [ -n "$session" ] || continue
+        active="$($LOGINCTL_BIN show-session "$session" -p Active --value 2>/dev/null || true)"
+        remote="$($LOGINCTL_BIN show-session "$session" -p Remote --value 2>/dev/null || true)"
+        class="$($LOGINCTL_BIN show-session "$session" -p Class --value 2>/dev/null || true)"
+        type="$($LOGINCTL_BIN show-session "$session" -p Type --value 2>/dev/null || true)"
+        if [ "$active" = "yes" ] && [ "$remote" = "no" ] && [ "$class" = "user" ] && \
+           { [ "$type" = "wayland" ] || [ "$type" = "x11" ]; }; then
+            return 0
+        fi
+    done < <($LOGINCTL_BIN list-sessions --no-legend 2>/dev/null | awk -v uid="$uid" '$2 == uid {print $1}')
+    return 1
+}
+
 dns_servers() {
     local physical="$1" gateway dns
     dns="$(resolvectl dns "$physical" 2>/dev/null | sed -n 's/^[^:]*:[[:space:]]*//p' | tr ' ' '\n' | grep -E '^[0-9]+(\.[0-9]+){3}$' || true)"
@@ -102,6 +127,14 @@ probe_online() {
     primary="$(probe_code "$namespace" "$CHECK_URL")"
     secondary="$(probe_code "$namespace" "$SECONDARY_CHECK_URL")"
     [ "$primary" = "204" ] && [ "$secondary" = "204" ]
+}
+
+portal_interception_detected() {
+    local primary="$1" secondary="$2"
+    { [[ "$primary" =~ ^[23][0-9][0-9]$ ]] || [ "$primary" = "511" ]; } && \
+        [ "$primary" != "204" ] || return 1
+    { [[ "$secondary" =~ ^[23][0-9][0-9]$ ]] || [ "$secondary" = "511" ]; } && \
+        [ "$secondary" != "204" ] || return 1
 }
 
 kill_browser() {
@@ -375,6 +408,10 @@ browser_binary() {
 
 launch_browser() {
     local url="$1" user runtime wayland browser
+    active_local_graphical_session "$CALLER_UID" || {
+        log "refusing browser launch because uid $CALLER_UID is not the active local graphical session"
+        return 1
+    }
     user="$(getent passwd "$CALLER_UID" | cut -d: -f1)"
     runtime="/run/user/$CALLER_UID"
     wayland="$(find "$runtime" -maxdepth 1 -type s -name 'wayland-*' -printf '%f\n' 2>/dev/null | head -n1)"
@@ -404,7 +441,7 @@ launch_browser() {
 }
 
 run_portal() {
-    local physical url elapsed code primary_code secondary_code
+    local physical url elapsed code primary_code secondary_code network_id
     [ "$(id -u)" -eq 0 ] || { echo "Production portal mode must run as root" >&2; return 2; }
     if [ "${WIREGUARD_PORTAL_LOCK_HELD:-0}" = "1" ]; then
         flock -n 8 || { echo "Inherited captive-portal lock is invalid" >&2; return 1; }
@@ -421,10 +458,15 @@ run_portal() {
         echo "Could not determine the invoking desktop user" >&2
         return 2
     }
+    active_local_graphical_session "$CALLER_UID" || {
+        echo "Invoking user is not the active local graphical session" >&2
+        return 2
+    }
     url="$(normalize_url "$REQUESTED_URL")"
     valid_url "$url" || { echo "Invalid portal URL: $url" >&2; return 2; }
     physical="$(physical_interface)"
     [ -n "$physical" ] || { echo "No physical default-route interface is ready" >&2; return 1; }
+    network_id="$(network_fingerprint "$physical")"
 
     : >"$PORTAL_LOG"
     chmod 0644 "$PORTAL_LOG"
@@ -461,13 +503,22 @@ run_portal() {
     code="gstatic=${primary_code:-000} cloudflare=${secondary_code:-000}"
     if [ "$primary_code" = "204" ] && [ "$secondary_code" = "204" ]; then
         log "no captive portal detected; independent probes returned HTTP 204 ($code)"
-    else
-        log "captive portal suspected ($code)"
+    elif portal_interception_detected "$primary_code" "$secondary_code"; then
+        log "captive portal confirmed by two HTTP interception responses ($code)"
         launch_browser "$url" || abort_portal 1
         elapsed=0
         while [ "$elapsed" -lt "$PORTAL_TIMEOUT" ]; do
             sleep "$POLL_INTERVAL"
             elapsed=$((elapsed + POLL_INTERVAL))
+            if [ "$(physical_interface)" != "$physical" ] || \
+               [ "$(network_fingerprint "$physical")" != "$network_id" ]; then
+                log "physical network changed during portal login; cancelling and returning fail-closed"
+                abort_portal 1
+            fi
+            if ! active_local_graphical_session "$CALLER_UID"; then
+                log "desktop session became inactive during portal login; cancelling and returning fail-closed"
+                abort_portal 1
+            fi
             if probe_online "$NS"; then
                 log "portal authentication detected after ${elapsed}s"
                 break
@@ -481,6 +532,9 @@ run_portal() {
             log "portal login timed out after ${PORTAL_TIMEOUT}s"
             abort_portal 1
         fi
+    else
+        log "portal detection was inconclusive; refusing to open a browser ($code)"
+        abort_portal 1
     fi
 
     # Host DNS is still blocked by the guard while wg0 is absent. Resolve and
@@ -524,5 +578,7 @@ simulate_portal() {
 case "$ACTION" in
     run) run_portal ;;
     simulate) simulate_portal "$@" ;;
+    classify-probes) portal_interception_detected "${2:-}" "${3:-}" ;;
+    session-active) active_local_graphical_session "${2:-}" ;;
     *) echo "Usage: wireguard-portal run <wg-iface> [url] <caller-uid> | simulate <url>" >&2; exit 2 ;;
 esac

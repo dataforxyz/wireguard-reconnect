@@ -69,11 +69,21 @@ case "$ACTION" in
 esac
 
 # Serialize Waybar, boot, resume, and network-monitor requests so two wg-quick
-# operations can never rewrite policy routes/nftables at the same time.
-exec 9>"$LOCK_FILE"
-if ! flock -w 30 9; then
-    echo "Timed out waiting for another WireGuard action" >"$LOG_FILE"
-    exit 1
+# operations can never rewrite policy routes/nftables at the same time. The
+# monitor may inherit fd 5 after atomically checking that the VPN is still stale.
+if [ "${WIREGUARD_RECONNECT_LOCK_HELD:-0}" = "1" ]; then
+    flock -n 5 || {
+        echo "Inherited WireGuard action lock is invalid" >"$LOG_FILE"
+        exit 1
+    }
+    RECONNECT_LOCK_FD=5
+else
+    exec 9>"$LOCK_FILE"
+    if ! flock -w 30 9; then
+        echo "Timed out waiting for another WireGuard action" >"$LOG_FILE"
+        exit 1
+    fi
+    RECONNECT_LOCK_FD=9
 fi
 
 : >"$LOG_FILE"
@@ -255,7 +265,8 @@ if [ "$ACTION" = "portal" ]; then
         printf 'PHASE=starting\nCALLER_UID=%s\n' "$caller_uid" >"$PORTAL_STATE"
     fi
     chmod 0644 "$PORTAL_STATE"
-    flock -u 9
+    flock -u "$RECONNECT_LOCK_FD"
+    unset WIREGUARD_RECONNECT_LOCK_HELD
     trap 'rm -f "$PORTAL_STATE"' EXIT
     export WIREGUARD_PORTAL_LOCK_HELD=1
     exec "$PORTAL_HELPER" run "$IFACE" "$PORTAL_URL" "$caller_uid"
