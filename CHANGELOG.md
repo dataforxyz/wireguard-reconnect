@@ -3,6 +3,41 @@
 All notable changes to this project are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-08-04
+
+### Added
+
+- Added Make targets for WireGuard status, toggle, disconnect, connect,
+  reconnect, reset, diagnostics, logs, tests, install, and captive-portal mode.
+- Added one-command captive-portal orchestration using a root-created network
+  namespace, veth/NAT isolation, an ephemeral Chromium-family browser profile,
+  automatic HTTP-204 login detection, cleanup, WireGuard restoration, and
+  post-connect verification.
+- Added no-root loopback and optional Docker-backed captive-portal simulators,
+  plus a rootless kernel namespace/nftables isolation smoke test.
+- Added Waybar portal-mode status and paused automatic reconnect attempts while
+  the isolated portal transaction owns the underlay.
+- Documented a safer Waybar binding that reserves connect/disconnect toggling
+  for middle-click and leaves the easier-to-hit left and right buttons unbound.
+
+### Fixed
+
+- Made intentional disconnect idempotent when `wg0` is already missing, so a
+  stuck fail-closed guard can still be cleanly reset for emergency recovery.
+
+### Security
+
+- Kept the host-wide kill switch armed throughout captive-portal login.
+- Restricted the portal namespace to DNS, HTTP, HTTPS, and QUIC, with explicit
+  source and unsolicited-ingress rejection before tunnel/private/LAN accepts.
+- Serialized every VPN action against portal mode, verified teardown before
+  clearing portal state, and preserved/restored only the required per-interface
+  forwarding settings without changing global IPv4 router mode.
+- Allowed portal isolation to start with an unresolved WireGuard endpoint while
+  still requiring verified policy-drop and namespace rules; portal DNS results
+  remain runtime candidates and are promoted to the persistent endpoint cache
+  only after full endpoint-aware connection and real WG traffic verification.
+
 ## [1.0.1] - 2026-07-15
 
 ### Fixed
@@ -37,5 +72,6 @@ All notable changes to this project are documented here. The project follows
 - Critical failures are recorded in `/run/wireguard-reconnect.failure` and
   surfaced in the Waybar tooltip.
 
+[1.1.0]: https://github.com/dataforxyz/wireguard-reconnect/releases/tag/v1.1.0
 [1.0.1]: https://github.com/dataforxyz/wireguard-reconnect/releases/tag/v1.0.1
 [1.0.0]: https://github.com/dataforxyz/wireguard-reconnect/releases/tag/v1.0.0

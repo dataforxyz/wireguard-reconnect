@@ -1,0 +1,528 @@
+#!/bin/bash
+# Fail-closed captive portal orchestrator.
+#
+# Production mode runs as root, creates an isolated network namespace, launches
+# an ephemeral Chromium profile inside it, waits for the portal to open normal
+# internet access, destroys the namespace, then restores and verifies WireGuard.
+# Normal host traffic remains subject to the wg-killswitch policy throughout.
+
+set -euo pipefail
+
+ACTION="${1:-run}"
+IFACE="${2:-wg0}"
+REQUESTED_URL="${3:-}"
+CALLER_UID="${4:-${PKEXEC_UID:-}}"
+
+NS="wgportal"
+HOST_IFACE="wgportal0"
+NS_IFACE="eth0"
+HOST_ADDR="10.254.254.1/30"
+NS_ADDR="10.254.254.2/30"
+NS_GATEWAY="10.254.254.1"
+PORTAL_TABLE_FAMILY="ip"
+PORTAL_TABLE_NAME="wg_portal"
+PORTAL_STATE="/run/wireguard-portal.active"
+PORTAL_LOCK="/run/wireguard-portal.lock"
+PORTAL_LOG="/run/wireguard-portal.log"
+PORTAL_ENDPOINT_CANDIDATE="/run/wg-killswitch.portal-candidate"
+PERSISTENT_ENDPOINT_CACHE="/var/lib/wg-killswitch/endpoint"
+CHECK_URL="http://connectivitycheck.gstatic.com/generate_204"
+SECONDARY_CHECK_URL="http://cp.cloudflare.com/generate_204"
+CHECK_TIMEOUT=5
+POLL_INTERVAL=2
+PORTAL_TIMEOUT=600
+RECONNECT_HELPER="/usr/local/bin/wireguard-reconnect"
+BROWSER_PID=""
+PROFILE_DIR=""
+NETNS_READY=0
+PORTAL_FORWARD_PREVIOUS=""
+PHYSICAL_FORWARD_PREVIOUS=""
+PHYSICAL_IFACE=""
+
+refresh_waybar() {
+    [[ "$CALLER_UID" =~ ^[0-9]+$ ]] || return 0
+    pkill -RTMIN+10 -u "$CALLER_UID" waybar 2>/dev/null || true
+}
+
+log() {
+    local message="$*"
+    printf '[%s] %s\n' "$(date -Is)" "$message" >>"$PORTAL_LOG" 2>/dev/null || true
+    logger -t wireguard-portal "$message" 2>/dev/null || true
+    printf 'wireguard-portal: %s\n' "$message"
+}
+
+valid_iface() {
+    [[ "$1" =~ ^wg[0-9]+$ ]]
+}
+
+valid_url() {
+    local url="$1"
+    [ ${#url} -le 2048 ] || return 1
+    [[ "$url" =~ ^https?:// ]] && [[ ! "$url" =~ [[:space:]] ]]
+}
+
+normalize_url() {
+    local value="$1"
+    if [ -z "$value" ]; then
+        printf '%s\n' "$CHECK_URL"
+    elif [[ "$value" =~ ^https?:// ]]; then
+        printf '%s\n' "$value"
+    else
+        printf 'http://%s\n' "$value"
+    fi
+}
+
+physical_interface() {
+    ip -4 route show table main default 2>/dev/null | awk '
+        $0 !~ / dev (wg[0-9]*|tailscale[0-9]*|tun[0-9]*|tap[0-9]*)/ {
+            for (i=1; i<=NF; i++) if ($i == "dev") { print $(i+1); exit }
+        }
+    '
+}
+
+dns_servers() {
+    local physical="$1" gateway dns
+    dns="$(resolvectl dns "$physical" 2>/dev/null | sed -n 's/^[^:]*:[[:space:]]*//p' | tr ' ' '\n' | grep -E '^[0-9]+(\.[0-9]+){3}$' || true)"
+    gateway="$(ip -4 route show table main default dev "$physical" 2>/dev/null | awk '/default via / {print $3; exit}')"
+    {
+        printf '%s\n' "$dns"
+        printf '%s\n' "$gateway"
+        printf '%s\n' '1.1.1.1' '8.8.8.8'
+    } | awk 'NF && !seen[$0]++'
+}
+
+probe_code() {
+    local namespace="$1" url="${2:-$CHECK_URL}"
+    ip netns exec "$namespace" curl --silent --show-error --max-time "$CHECK_TIMEOUT" \
+        --output /dev/null --write-out '%{http_code}' "$url" 2>/dev/null || true
+}
+
+probe_online() {
+    local namespace="$1" primary secondary
+    primary="$(probe_code "$namespace" "$CHECK_URL")"
+    secondary="$(probe_code "$namespace" "$SECONDARY_CHECK_URL")"
+    [ "$primary" = "204" ] && [ "$secondary" = "204" ]
+}
+
+kill_browser() {
+    local _
+    if [ -n "$BROWSER_PID" ]; then
+        kill -- "-$BROWSER_PID" 2>/dev/null || kill "$BROWSER_PID" 2>/dev/null || true
+        for _ in $(seq 1 20); do
+            kill -0 "$BROWSER_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+        if kill -0 "$BROWSER_PID" 2>/dev/null; then
+            kill -KILL -- "-$BROWSER_PID" 2>/dev/null || kill -KILL "$BROWSER_PID" 2>/dev/null || true
+        fi
+        wait "$BROWSER_PID" 2>/dev/null || true
+        BROWSER_PID=""
+    fi
+}
+
+portal_resources_present() {
+    ip netns list 2>/dev/null | awk '{print $1}' | grep -Fxq "$NS" && return 0
+    ip link show "$HOST_IFACE" >/dev/null 2>&1 && return 0
+    nft list table "$PORTAL_TABLE_FAMILY" "$PORTAL_TABLE_NAME" >/dev/null 2>&1 && return 0
+    [ -e "/etc/netns/$NS" ] && return 0
+    return 1
+}
+
+early_exit_cleanup() {
+    # Parent creates the marker before exec to close the monitor race. Own stale
+    # resource and forwarding-state cleanup even when child validation fails.
+    if cleanup_namespace; then
+        rm -f "$PORTAL_ENDPOINT_CANDIDATE"
+    fi
+}
+
+capture_forwarding_state() {
+    local physical="$1" portal_key physical_key
+    portal_key="net.ipv4.conf.${HOST_IFACE}.forwarding"
+    physical_key="net.ipv4.conf.${physical}.forwarding"
+    PORTAL_FORWARD_PREVIOUS="$(sysctl -n "$portal_key" 2>/dev/null || true)"
+    PHYSICAL_FORWARD_PREVIOUS="$(sysctl -n "$physical_key" 2>/dev/null || true)"
+    [[ "$PORTAL_FORWARD_PREVIOUS" =~ ^[01]$ ]] && \
+      [[ "$PHYSICAL_FORWARD_PREVIOUS" =~ ^[01]$ ]] || {
+        log "could not read per-interface IPv4 forwarding state"
+        return 1
+    }
+    PHYSICAL_IFACE="$physical"
+    {
+        printf 'PHYSICAL_IFACE=%s\n' "$PHYSICAL_IFACE"
+        printf 'PORTAL_FORWARD_PREVIOUS=%s\n' "$PORTAL_FORWARD_PREVIOUS"
+        printf 'PHYSICAL_FORWARD_PREVIOUS=%s\n' "$PHYSICAL_FORWARD_PREVIOUS"
+    } >>"$PORTAL_STATE"
+}
+
+enable_forwarding() {
+    local portal_key="net.ipv4.conf.${HOST_IFACE}.forwarding"
+    local physical_key="net.ipv4.conf.${PHYSICAL_IFACE}.forwarding"
+    sysctl -q -w "$portal_key=1"
+    sysctl -q -w "$physical_key=1"
+    [ "$(sysctl -n "$portal_key" 2>/dev/null || true)" = "1" ] && \
+      [ "$(sysctl -n "$physical_key" 2>/dev/null || true)" = "1" ]
+}
+
+cleanup_namespace() {
+    local profile_to_remove=""
+    kill_browser
+    if [ -r "$PORTAL_STATE" ]; then
+        [ -n "$PHYSICAL_IFACE" ] || PHYSICAL_IFACE="$(awk -F= '$1 == "PHYSICAL_IFACE" {print $2; exit}' "$PORTAL_STATE" 2>/dev/null || true)"
+        [ -n "$PORTAL_FORWARD_PREVIOUS" ] || PORTAL_FORWARD_PREVIOUS="$(awk -F= '$1 == "PORTAL_FORWARD_PREVIOUS" {print $2; exit}' "$PORTAL_STATE" 2>/dev/null || true)"
+        [ -n "$PHYSICAL_FORWARD_PREVIOUS" ] || PHYSICAL_FORWARD_PREVIOUS="$(awk -F= '$1 == "PHYSICAL_FORWARD_PREVIOUS" {print $2; exit}' "$PORTAL_STATE" 2>/dev/null || true)"
+    fi
+    # Restore per-interface forwarding while the portal-only gate still exists.
+    # The global ip_forward/router role is never changed.
+    if ip link show "$HOST_IFACE" >/dev/null 2>&1 && [[ "$PORTAL_FORWARD_PREVIOUS" =~ ^[01]$ ]]; then
+        sysctl -q -w "net.ipv4.conf.${HOST_IFACE}.forwarding=$PORTAL_FORWARD_PREVIOUS" || {
+            log "CRITICAL: could not restore $HOST_IFACE forwarding"
+            return 1
+        }
+    fi
+    if [ -n "$PHYSICAL_IFACE" ] && [[ "$PHYSICAL_FORWARD_PREVIOUS" =~ ^[01]$ ]]; then
+        if ip link show "$PHYSICAL_IFACE" >/dev/null 2>&1; then
+            sysctl -q -w "net.ipv4.conf.${PHYSICAL_IFACE}.forwarding=$PHYSICAL_FORWARD_PREVIOUS" || {
+                log "CRITICAL: could not restore $PHYSICAL_IFACE forwarding"
+                return 1
+            }
+        else
+            log "physical interface $PHYSICAL_IFACE disappeared; no forwarding state remains to restore"
+        fi
+    fi
+
+    # Cut the veth path before removing any nftables gate. Even if a browser
+    # subprocess survived termination, it cannot transmit during teardown.
+    ip link set "$HOST_IFACE" down 2>/dev/null || true
+    ip link del "$HOST_IFACE" 2>/dev/null || true
+    ip netns del "$NS" 2>/dev/null || true
+    if ip link show "$HOST_IFACE" >/dev/null 2>&1 || \
+       ip netns list 2>/dev/null | awk '{print $1}' | grep -Fxq "$NS"; then
+        log "CRITICAL: could not cut the portal namespace veth path; retaining firewall and marker"
+        return 1
+    fi
+
+    nft delete table "$PORTAL_TABLE_FAMILY" "$PORTAL_TABLE_NAME" 2>/dev/null || true
+    rm -rf "/etc/netns/$NS"
+    if [ -z "$PROFILE_DIR" ] && [ -r "$PORTAL_STATE" ]; then
+        PROFILE_DIR="$(awk -F= '$1 == "PROFILE_DIR" {print substr($0, length($1) + 2); exit}' "$PORTAL_STATE" 2>/dev/null || true)"
+    fi
+    if [[ "$PROFILE_DIR" =~ ^/run/user/[0-9]+/wireguard-portal\.[A-Za-z0-9]+$ ]]; then
+        profile_to_remove="$PROFILE_DIR"
+        rm -rf "$profile_to_remove"
+    fi
+    PROFILE_DIR=""
+
+    if portal_resources_present || { [ -n "$profile_to_remove" ] && [ -e "$profile_to_remove" ]; }; then
+        log "CRITICAL: portal namespace cleanup is incomplete; retaining active marker"
+        return 1
+    fi
+    PORTAL_FORWARD_PREVIOUS=""
+    PHYSICAL_FORWARD_PREVIOUS=""
+    PHYSICAL_IFACE=""
+    rm -f "$PORTAL_STATE"
+    refresh_waybar
+    NETNS_READY=0
+}
+
+
+refresh_endpoint_cache() {
+    local conf endpoint host port endpoint4 mark
+    conf="/etc/wireguard/${IFACE}.conf"
+    endpoint="$(awk -F= '
+        /^[[:space:]]*Endpoint[[:space:]]*=/ {
+            value=$2
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+            print value
+            exit
+        }
+    ' "$conf" 2>/dev/null || true)"
+    if [[ "$endpoint" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+    elif [[ "$endpoint" =~ ^([^:]+):([0-9]+)$ ]]; then
+        host="${BASH_REMATCH[1]}"
+        port="${BASH_REMATCH[2]}"
+    else
+        log "could not parse the WireGuard endpoint for protected reconnect"
+        return 1
+    fi
+
+    if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        endpoint4="$host"
+    else
+        endpoint4="$(ip netns exec "$NS" getent ahostsv4 "$host" 2>/dev/null | awk 'NF {print $1; exit}' || true)"
+    fi
+    [[ "$endpoint4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || {
+        log "portal DNS could not resolve the WireGuard endpoint $host"
+        return 1
+    }
+
+    mark="$(wg show "$IFACE" fwmark 2>/dev/null | awk 'NF {print $1; exit}' || true)"
+    [ -n "$mark" ] && [ "$mark" != "off" ] || mark="0xca6c"
+    {
+        printf 'IFACE=%s\n' "$IFACE"
+        printf 'ENDPOINT_HOST=%s\n' "$host"
+        printf 'ENDPOINT_PORT=%s\n' "$port"
+        printf 'ENDPOINT4=%s\n' "$endpoint4"
+        printf 'ENDPOINT6=\n'
+        printf 'WG_MARK=%s\n' "$mark"
+    } >"$PORTAL_ENDPOINT_CANDIDATE"
+    chmod 0600 "$PORTAL_ENDPOINT_CANDIDATE"
+    log "staged the portal DNS result as an unverified runtime endpoint candidate"
+}
+
+restore_vpn() {
+    log "restoring WireGuard and fail-closed protection"
+    if WIREGUARD_PORTAL_RESTORE=1 "$RECONNECT_HELPER" reconnect "$IFACE"; then
+        local code
+        for _ in $(seq 1 15); do
+            if ip -4 route get 9.9.9.9 2>/dev/null | grep -q " dev ${IFACE}\\b"; then
+                code="$(curl --interface "$IFACE" --silent --show-error --max-time 4 \
+                    --output /dev/null --write-out '%{http_code}' "$CHECK_URL" 2>/dev/null || true)"
+                if [ "$code" = "204" ]; then
+                    if [ -r "$PORTAL_ENDPOINT_CANDIDATE" ]; then
+                        install -d -m 0700 "$(dirname "$PERSISTENT_ENDPOINT_CACHE")"
+                        cp "$PORTAL_ENDPOINT_CANDIDATE" "$PERSISTENT_ENDPOINT_CACHE"
+                        chmod 0600 "$PERSISTENT_ENDPOINT_CACHE"
+                        rm -f "$PORTAL_ENDPOINT_CANDIDATE"
+                        log "promoted the endpoint candidate after verified WireGuard traffic"
+                    fi
+                    log "WireGuard restored and verified"
+                    return 0
+                fi
+            fi
+            sleep 2
+        done
+    fi
+    rm -f "$PORTAL_ENDPOINT_CANDIDATE"
+    log "CRITICAL: WireGuard could not be verified; discarded endpoint candidate and kept the kill switch fail-closed"
+    return 1
+}
+
+abort_portal() {
+    local rc="${1:-1}"
+    trap - EXIT
+    trap '' HUP INT TERM
+    if cleanup_namespace; then
+        restore_vpn || true
+    else
+        log "CRITICAL: refusing VPN changes until portal cleanup is completed"
+    fi
+    exit "$rc"
+}
+
+setup_namespace() {
+    local physical="$1" dns
+
+    install -d -m 0755 "/etc/netns/$NS"
+    : >"/etc/netns/$NS/resolv.conf"
+    while IFS= read -r dns; do
+        [ -n "$dns" ] && printf 'nameserver %s\n' "$dns" >>"/etc/netns/$NS/resolv.conf"
+    done < <(dns_servers "$physical")
+    # Arch uses nss-resolve before libc DNS. Without a namespace-specific
+    # nsswitch file, Chromium/getent would ask the host systemd-resolved daemon,
+    # whose public DNS traffic correctly remains blocked by the host guard.
+    # Force portal processes to use the namespace's own resolv.conf instead.
+    awk '
+        /^hosts:/ { print "hosts: files dns"; next }
+        { print }
+    ' /etc/nsswitch.conf >"/etc/netns/$NS/nsswitch.conf"
+
+    ip netns add "$NS"
+    ip link add "$HOST_IFACE" type veth peer name "$NS_IFACE"
+    ip link set "$NS_IFACE" netns "$NS"
+    ip address add "$HOST_ADDR" dev "$HOST_IFACE"
+    ip link set "$HOST_IFACE" up
+    ip netns exec "$NS" ip link set lo up
+    ip netns exec "$NS" ip address add "$NS_ADDR" dev "$NS_IFACE"
+    ip netns exec "$NS" ip link set "$NS_IFACE" up
+    ip netns exec "$NS" ip route add default via "$NS_GATEWAY" dev "$NS_IFACE"
+
+    capture_forwarding_state "$physical"
+    nft delete table "$PORTAL_TABLE_FAMILY" "$PORTAL_TABLE_NAME" 2>/dev/null || true
+    nft add table "$PORTAL_TABLE_FAMILY" "$PORTAL_TABLE_NAME"
+    nft "add chain $PORTAL_TABLE_FAMILY $PORTAL_TABLE_NAME postrouting { type nat hook postrouting priority srcnat; policy accept; }"
+    nft add rule "$PORTAL_TABLE_FAMILY" "$PORTAL_TABLE_NAME" postrouting \
+        ip saddr 10.254.254.0/30 oifname "$physical" masquerade
+    # If the physical interface was not previously forwarding, enable only the
+    # portal reply path from that ingress. Existing Docker/libvirt/Tailscale
+    # forwarding on other interfaces remains untouched.
+    if [ "$PHYSICAL_FORWARD_PREVIOUS" != "1" ]; then
+        nft "add chain $PORTAL_TABLE_FAMILY $PORTAL_TABLE_NAME portal_forward_gate { type filter hook forward priority -10; policy accept; }"
+        nft add rule "$PORTAL_TABLE_FAMILY" "$PORTAL_TABLE_NAME" portal_forward_gate \
+            iifname "$physical" oifname "$HOST_IFACE" ct state established,related accept
+        nft add rule "$PORTAL_TABLE_FAMILY" "$PORTAL_TABLE_NAME" portal_forward_gate \
+            iifname "$physical" drop
+    fi
+    # The portal page must not use the veth gateway to probe services on the
+    # host itself. Replies to forwarded/NATed internet traffic use FORWARD, not
+    # INPUT, so rejecting all namespace-originated host input is safe.
+    nft "add chain $PORTAL_TABLE_FAMILY $PORTAL_TABLE_NAME portal_input { type filter hook input priority -10; policy accept; }"
+    nft add rule "$PORTAL_TABLE_FAMILY" "$PORTAL_TABLE_NAME" portal_input \
+        iifname "$HOST_IFACE" reject with icmp type admin-prohibited
+
+    log "isolated portal namespace ready on $physical"
+}
+
+browser_binary() {
+    local browser
+    for browser in /usr/bin/chromium /usr/bin/brave /usr/bin/google-chrome-stable; do
+        [ -x "$browser" ] && { printf '%s\n' "$browser"; return 0; }
+    done
+    return 1
+}
+
+launch_browser() {
+    local url="$1" user runtime wayland browser
+    user="$(getent passwd "$CALLER_UID" | cut -d: -f1)"
+    runtime="/run/user/$CALLER_UID"
+    wayland="$(find "$runtime" -maxdepth 1 -type s -name 'wayland-*' -printf '%f\n' 2>/dev/null | head -n1)"
+    browser="$(browser_binary)" || { log "no supported Chromium-family browser found"; return 1; }
+    [ -n "$user" ] && [ -n "$wayland" ] || {
+        log "could not determine the active Wayland desktop session for uid $CALLER_UID"
+        return 1
+    }
+
+    PROFILE_DIR="$(mktemp -d "$runtime/wireguard-portal.XXXXXX")"
+    printf 'PROFILE_DIR=%s\n' "$PROFILE_DIR" >>"$PORTAL_STATE"
+    chown -R "$CALLER_UID:$(id -g "$user")" "$PROFILE_DIR"
+
+    log "opening ephemeral portal browser for $url"
+    setsid ip netns exec "$NS" runuser -u "$user" -- env \
+        HOME="$PROFILE_DIR" USER="$user" LOGNAME="$user" \
+        XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY="$wayland" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/wireguard-portal-no-dbus" \
+        "$browser" \
+        --user-data-dir="$PROFILE_DIR" \
+        --ozone-platform=wayland \
+        --no-first-run --no-default-browser-check --incognito \
+        --disable-sync --disable-background-networking --disable-component-update \
+        --disable-default-apps --disable-extensions --disable-features=AsyncDns,MediaRouter \
+        --new-window "$url" >/dev/null 2>&1 &
+    BROWSER_PID=$!
+}
+
+run_portal() {
+    local physical url elapsed code primary_code secondary_code
+    [ "$(id -u)" -eq 0 ] || { echo "Production portal mode must run as root" >&2; return 2; }
+    if [ "${WIREGUARD_PORTAL_LOCK_HELD:-0}" = "1" ]; then
+        flock -n 8 || { echo "Inherited captive-portal lock is invalid" >&2; return 1; }
+    else
+        exec 8>"$PORTAL_LOCK"
+        flock -n 8 || { echo "Another captive-portal transaction is already active" >&2; return 1; }
+    fi
+    # The parent marker exists before exec. Own its cleanup immediately so
+    # invalid input or a missing physical route cannot pause monitoring forever.
+    trap early_exit_cleanup EXIT
+    trap 'exit 130' HUP INT TERM
+    valid_iface "$IFACE" || { echo "Invalid interface: $IFACE" >&2; return 2; }
+    [[ "$CALLER_UID" =~ ^[0-9]+$ ]] && [ "$CALLER_UID" -ge 1000 ] || {
+        echo "Could not determine the invoking desktop user" >&2
+        return 2
+    }
+    url="$(normalize_url "$REQUESTED_URL")"
+    valid_url "$url" || { echo "Invalid portal URL: $url" >&2; return 2; }
+    physical="$(physical_interface)"
+    [ -n "$physical" ] || { echo "No physical default-route interface is ready" >&2; return 1; }
+
+    : >"$PORTAL_LOG"
+    chmod 0644 "$PORTAL_LOG"
+    cleanup_namespace
+    trap 'abort_portal 130' HUP INT TERM
+    trap 'if [ "$NETNS_READY" = 1 ]; then abort_portal 1; else early_exit_cleanup; fi' EXIT
+    # Set the state marker before taking wg0 down. This pauses the normal
+    # network monitor for the entire isolated portal transaction.
+    NETNS_READY=1
+    printf 'PHYSICAL_IFACE=%s\nCALLER_UID=%s\nSTARTED=%s\n' \
+        "$physical" "$CALLER_UID" "$(date -Is)" >"$PORTAL_STATE"
+    chmod 0644 "$PORTAL_STATE"
+    refresh_waybar
+
+    # The parent reconnect helper pre-arms and verifies the host kill switch.
+    # Take wg0 down without disabling that guard; only the isolated namespace
+    # receives a narrowly constrained forwarding exception.
+    if ip link show "$IFACE" >/dev/null 2>&1; then
+        log "taking $IFACE down while the host guard remains armed"
+        if ! wg-quick down "$IFACE" >>"$PORTAL_LOG" 2>&1; then
+            log "could not take $IFACE down; refusing to create a direct portal path"
+            return 1
+        fi
+    fi
+    if ip link show "$IFACE" >/dev/null 2>&1; then
+        log "$IFACE is still present; refusing to create a direct portal path"
+        return 1
+    fi
+
+    setup_namespace "$physical"
+    enable_forwarding || abort_portal 1
+    primary_code="$(probe_code "$NS" "$CHECK_URL")"
+    secondary_code="$(probe_code "$NS" "$SECONDARY_CHECK_URL")"
+    code="gstatic=${primary_code:-000} cloudflare=${secondary_code:-000}"
+    if [ "$primary_code" = "204" ] && [ "$secondary_code" = "204" ]; then
+        log "no captive portal detected; independent probes returned HTTP 204 ($code)"
+    else
+        log "captive portal suspected ($code)"
+        launch_browser "$url" || abort_portal 1
+        elapsed=0
+        while [ "$elapsed" -lt "$PORTAL_TIMEOUT" ]; do
+            sleep "$POLL_INTERVAL"
+            elapsed=$((elapsed + POLL_INTERVAL))
+            if probe_online "$NS"; then
+                log "portal authentication detected after ${elapsed}s"
+                break
+            fi
+            if ! kill -0 "$BROWSER_PID" 2>/dev/null; then
+                log "portal browser closed before authentication completed"
+                abort_portal 1
+            fi
+        done
+        if [ "$elapsed" -ge "$PORTAL_TIMEOUT" ] && ! probe_online "$NS"; then
+            log "portal login timed out after ${PORTAL_TIMEOUT}s"
+            abort_portal 1
+        fi
+    fi
+
+    # Host DNS is still blocked by the guard while wg0 is absent. Resolve and
+    # cache the WG endpoint from the isolated, now-authenticated namespace so
+    # the normal reconnect helper can rebuild its endpoint-only exception.
+    refresh_endpoint_cache || log "protected reconnect will rely on an existing endpoint cache"
+
+    trap - EXIT
+    trap '' HUP INT TERM
+    if ! cleanup_namespace; then
+        log "CRITICAL: refusing VPN changes until portal cleanup is completed"
+        return 1
+    fi
+    restore_vpn
+}
+
+simulate_portal() {
+    local url="${2:-}" code location elapsed=0
+    [ -n "$url" ] || { echo "Usage: wireguard-portal simulate <check-url>" >&2; return 2; }
+    valid_url "$url" || { echo "Invalid simulation URL: $url" >&2; return 2; }
+    echo "SIMULATE: host kill switch remains armed"
+    code="$(curl --silent --show-error --max-time 3 --output /dev/null --write-out '%{http_code}' "$url" 2>/dev/null || true)"
+    echo "SIMULATE: initial detector response HTTP ${code:-000}"
+    if [ "$code" != "204" ]; then
+        location="$(curl --silent --show-error --max-time 3 --output /dev/null --write-out '%{redirect_url}' "$url" 2>/dev/null || true)"
+        echo "SIMULATE: captive portal detected; isolated browser would open ${location:-$url}"
+        # Visiting the redirect simulates completing the local test portal.
+        [ -n "$location" ] && curl --silent --show-error --max-time 3 "$location" >/dev/null 2>&1 || true
+        while [ "$elapsed" -lt 10 ]; do
+            sleep 1
+            elapsed=$((elapsed + 1))
+            code="$(curl --silent --show-error --max-time 3 --output /dev/null --write-out '%{http_code}' "$url" 2>/dev/null || true)"
+            [ "$code" = "204" ] && break
+        done
+    fi
+    [ "$code" = "204" ] || { echo "SIMULATE: portal did not authorize" >&2; return 1; }
+    echo "SIMULATE: HTTP 204 detected; namespace would be destroyed"
+    echo "SIMULATE: WireGuard reconnect and verification would run"
+}
+
+case "$ACTION" in
+    run) run_portal ;;
+    simulate) simulate_portal "$@" ;;
+    *) echo "Usage: wireguard-portal run <wg-iface> [url] <caller-uid> | simulate <url>" >&2; exit 2 ;;
+esac

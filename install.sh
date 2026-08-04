@@ -26,12 +26,18 @@ if [ -z "$TARGET_HOME" ] || [ ! -d "$TARGET_HOME" ]; then
     exit 1
 fi
 
-for command in install systemctl ip wg wg-quick curl flock nft pkexec; do
+for command in install systemctl ip wg wg-quick curl flock nft pkexec runuser; do
     command -v "$command" >/dev/null 2>&1 || {
         echo "Missing required command: $command" >&2
         exit 1
     }
 done
+if ! command -v chromium >/dev/null 2>&1 && \
+   ! command -v brave >/dev/null 2>&1 && \
+   ! command -v google-chrome-stable >/dev/null 2>&1; then
+    echo "Missing a supported captive-portal browser (chromium, brave, or google-chrome-stable)" >&2
+    exit 1
+fi
 
 BACKUP_DIR="/var/backups/wireguard-reconnect-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BACKUP_DIR"
@@ -44,6 +50,7 @@ backup_if_present() {
 }
 
 backup_if_present /usr/local/bin/wireguard-reconnect
+backup_if_present /usr/local/bin/wireguard-portal
 backup_if_present /usr/local/bin/wireguard-monitor
 backup_if_present /usr/local/bin/wireguard-autostart
 backup_if_present /usr/local/bin/wg-killswitch
@@ -58,6 +65,7 @@ backup_if_present "$TARGET_HOME/.local/bin/wireguard-status"
 echo "Installing WireGuard reconnect v${PROJECT_VERSION} components..."
 install -Dm644 "$SCRIPT_DIR/VERSION" /usr/local/share/wireguard-reconnect/VERSION
 install -Dm755 "$SCRIPT_DIR/wireguard-reconnect" /usr/local/bin/wireguard-reconnect
+install -Dm755 "$SCRIPT_DIR/wireguard-portal" /usr/local/bin/wireguard-portal
 install -Dm755 "$SCRIPT_DIR/wireguard-monitor" /usr/local/bin/wireguard-monitor
 install -Dm755 "$SCRIPT_DIR/wireguard-autostart" /usr/local/bin/wireguard-autostart
 install -Dm755 "$SCRIPT_DIR/wg-killswitch" /usr/local/bin/wg-killswitch

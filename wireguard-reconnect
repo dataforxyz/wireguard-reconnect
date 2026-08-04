@@ -18,6 +18,8 @@ FAILURE_STATE="/run/wireguard-reconnect.failure"
 LOCK_FILE="/run/wireguard-reconnect.lock"
 INTENT_STATE="${WIREGUARD_INTENT_STATE:-/run/wireguard-reconnect.enabled}"
 KILLSWITCH_HELPER="/usr/local/bin/wg-killswitch"
+PORTAL_HELPER="/usr/local/bin/wireguard-portal"
+PORTAL_STATE="/run/wireguard-portal.active"
 KILLSWITCH_ENABLED="${WIREGUARD_KILLSWITCH:-1}"
 KILLSWITCH_STATE="/run/wg-killswitch.enabled"
 KILLSWITCH_ENDPOINT_STATE="/run/wg-killswitch.endpoint"
@@ -26,6 +28,7 @@ TAILSCALE_OPERATOR="${TAILSCALE_OPERATOR:-dxyz}"
 
 ACTION="${1:-}"
 IFACE="${2:-wg0}"
+PORTAL_URL="${3:-}"
 WG_CONF="/etc/wireguard/${IFACE}.conf"
 
 print_version() {
@@ -58,7 +61,7 @@ if [ ! -f "$WG_CONF" ]; then
     exit 2
 fi
 case "$ACTION" in
-    up|down|reconnect) ;;
+    up|down|reconnect|portal) ;;
     *)
         echo "Unknown WireGuard action: $ACTION" >"$LOG_FILE"
         exit 2
@@ -75,6 +78,34 @@ fi
 
 : >"$LOG_FILE"
 chmod 0644 "$LOG_FILE" 2>/dev/null || true
+
+# Every action coordinates with the long-lived portal transaction. In
+# particular, an intentional `down` must never disable the host guard while the
+# isolated browser namespace still has a forwarded underlay path.
+if [ "${WIREGUARD_PORTAL_RESTORE:-0}" = "1" ]; then
+    # The portal orchestrator retains fd 8 across its authorized restore so the
+    # whole cleanup/reconnect/verification transaction remains atomic.
+    flock -n 8 || {
+        echo "Inherited captive-portal restore lock is invalid" >"$LOG_FILE"
+        exit 1
+    }
+else
+    exec 8>/run/wireguard-portal.lock
+fi
+if [ "${WIREGUARD_PORTAL_RESTORE:-0}" = "1" ] || flock -n 8; then
+    if [ "$ACTION" = "portal" ]; then
+        # No live orchestrator owns the lock. Keep it across exec so no second
+        # request can enter before the portal helper validates and cleans any
+        # stale namespace resources/marker.
+        :
+    elif [ -f "$PORTAL_STATE" ]; then
+        echo "Captive-portal cleanup is incomplete; refusing $ACTION" >"$LOG_FILE"
+        exit 1
+    fi
+else
+    echo "Captive-portal mode is active; refusing $ACTION" >"$LOG_FILE"
+    exit 1
+fi
 
 critical() {
     local message="$*"
@@ -93,7 +124,7 @@ clear_failure() {
 # deliberate disconnect clears it; boot recreates it because VPN-on is the
 # default policy for each new system session.
 case "$ACTION" in
-    up|reconnect)
+    up|reconnect|portal)
         printf '%s\n' "$IFACE" >"$INTENT_STATE"
         chmod 0644 "$INTENT_STATE" 2>/dev/null || true
         ;;
@@ -175,11 +206,59 @@ arm_and_verify_kill_switch() {
     fi
 }
 
-# A connect/reconnect is never allowed to start without a verified nftables
-# guard. During reconnect the guard remains active while wg0 is absent, so
-# public traffic is blocked rather than falling back to the physical network.
-if [ "$ACTION" != "down" ]; then
-    arm_and_verify_kill_switch || exit 1
+arm_and_verify_portal_guard() {
+    [ "$KILLSWITCH_ENABLED" = "1" ] || {
+        critical "captive-portal mode requires the kill switch"
+        return 1
+    }
+    if [ ! -x "$KILLSWITCH_HELPER" ]; then
+        critical "kill-switch helper is missing; refusing captive-portal mode"
+        return 1
+    fi
+
+    echo "[#] pre-arming fail-closed host and isolated portal rules for $IFACE" >>"$LOG_FILE"
+    # Endpoint DNS is often unavailable before portal authentication. `enable`
+    # intentionally returns non-zero in that case but still installs a blocking
+    # guard. Portal verification requires the policy-drop host rules and the
+    # restricted namespace exception, not a WG endpoint exception yet.
+    /usr/bin/timeout 15s "$KILLSWITCH_HELPER" enable "$IFACE" >>"$LOG_FILE" 2>&1 || true
+    if ! "$KILLSWITCH_HELPER" status-portal >>"$LOG_FILE" 2>&1; then
+        critical "could not verify fail-closed captive-portal isolation"
+        return 1
+    fi
+}
+
+# Connect/reconnect requires the complete endpoint-aware guard. Portal mode can
+# safely start with an unresolved endpoint because only its restricted namespace
+# is allowed out; the complete guard is required again after login.
+case "$ACTION" in
+    portal) arm_and_verify_portal_guard || exit 1 ;;
+    up|reconnect) arm_and_verify_kill_switch || exit 1 ;;
+esac
+
+# Portal mode hands control to a separate fixed root helper after the host guard
+# is verified. Release the reconnect lock first: the portal helper reacquires it
+# through a normal reconnect after destroying its isolated namespace.
+if [ "$ACTION" = "portal" ]; then
+    caller_uid="${PKEXEC_UID:-${SUDO_UID:-}}"
+    if [ ! -x "$PORTAL_HELPER" ]; then
+        critical "captive-portal helper is missing"
+        exit 1
+    fi
+    if ! [[ "$caller_uid" =~ ^[0-9]+$ ]]; then
+        critical "could not identify the user requesting captive-portal mode"
+        exit 1
+    fi
+    if [ -f "$PORTAL_STATE" ]; then
+        printf 'RECOVERY_STARTED=%s\nCALLER_UID=%s\n' "$(date -Is)" "$caller_uid" >>"$PORTAL_STATE"
+    else
+        printf 'PHASE=starting\nCALLER_UID=%s\n' "$caller_uid" >"$PORTAL_STATE"
+    fi
+    chmod 0644 "$PORTAL_STATE"
+    flock -u 9
+    trap 'rm -f "$PORTAL_STATE"' EXIT
+    export WIREGUARD_PORTAL_LOCK_HELD=1
+    exec "$PORTAL_HELPER" run "$IFACE" "$PORTAL_URL" "$caller_uid"
 fi
 
 # Intentionally disconnecting is the only action that removes the guard. This
@@ -210,9 +289,17 @@ case "$ACTION" in
         fi
         ;;
     down)
-        if ! /usr/bin/wg-quick down "$IFACE" >>"$LOG_FILE" 2>&1; then
-            critical "wg-quick down $IFACE failed"
-            exit 1
+        # Treat an already-missing interface as a successful intentional
+        # disconnect. The important recovery work above has still cleared VPN
+        # intent and disabled the fail-closed guard; reporting failure here used
+        # to leave a misleading critical state after resetting a bricked tunnel.
+        if ip link show "$IFACE" >/dev/null 2>&1; then
+            if ! /usr/bin/wg-quick down "$IFACE" >>"$LOG_FILE" 2>&1; then
+                critical "wg-quick down $IFACE failed"
+                exit 1
+            fi
+        else
+            echo "[#] $IFACE is already absent; disconnect state is clean" >>"$LOG_FILE"
         fi
         ;;
     reconnect)

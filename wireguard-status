@@ -11,6 +11,7 @@ WAYBAR_SIGNAL="${WAYBAR_WIREGUARD_SIGNAL:-RTMIN+10}"
 # only read it for tooltips/error messages.
 LOG_FILE="/run/wireguard-reconnect.log"
 FAILURE_STATE="/run/wireguard-reconnect.failure"
+PORTAL_STATE="${WIREGUARD_PORTAL_STATE:-/run/wireguard-portal.active}"
 RECONNECT_HELPER="${WIREGUARD_RECONNECT_HELPER:-/usr/local/bin/wireguard-reconnect}"
 # Self-heal: when the interface is up but offline, attempt a hands-free
 # reconnect straight from the Waybar poll instead of waiting for a manual click.
@@ -178,6 +179,11 @@ run_wg_action() {
 toggle() {
     local active_iface wg_action target_interface rc
 
+    if [ -f "$PORTAL_STATE" ]; then
+        notify "VPN" "Captive portal login is active; VPN controls are temporarily locked"
+        exit 0
+    fi
+
     active_iface="$(active_interface 2>/dev/null || true)"
     if [ -n "$active_iface" ]; then
         target_interface="$active_iface"
@@ -211,16 +217,20 @@ toggle() {
 }
 
 disconnect() {
-    local active_iface rc
+    local active_iface target_interface rc
     active_iface="$(active_interface 2>/dev/null || true)"
-    [ -n "$active_iface" ] || exit 0
+    target_interface="${active_iface:-$INTERFACE}"
 
-    run_wg_action down "$active_iface"
+    # Always run the privileged down action, even if wg0 is already missing.
+    # The interface can disappear while the fail-closed guard and intended-on
+    # markers remain, which is exactly when an intentional disconnect/reset is
+    # needed to restore direct captive-portal or troubleshooting traffic.
+    run_wg_action down "$target_interface"
     rc=$?
     if [ "$rc" -eq 0 ]; then
-        notify "VPN" "WireGuard disconnected: ${active_iface}"
+        notify "VPN" "WireGuard disconnected: ${target_interface}"
     else
-        notify -u critical "VPN disconnect failed" "wg-quick down ${active_iface} failed: $(last_log_line)"
+        notify -u critical "VPN disconnect failed" "wg-quick down ${target_interface} failed: $(last_log_line)"
     fi
     exit "$rc"
 }
@@ -277,14 +287,14 @@ wake_monitor() {
 
         if [ "$attempt" -eq 1 ]; then
             notify -u normal "VPN waiting for network login" \
-                "Captive portal or Wi-Fi not ready. Finish portal login; WireGuard will retry for $((WAKE_ATTEMPTS * WAKE_INTERVAL / 60)) min."
+                "Captive portal or Wi-Fi not ready. Run 'make portal' from wireguard-reconnect for an isolated login."
         fi
 
         sleep "$WAKE_INTERVAL"
     done
 
     refresh_waybar
-    notify -u critical "VPN still offline" "Captive portal may still be blocking WireGuard. Right-click the VPN icon to disconnect, finish login, then left-click to reconnect."
+    notify -u critical "VPN still offline" "Captive portal may be blocking WireGuard. Run 'make portal' from wireguard-reconnect for an isolated login and automatic protected reconnect."
 }
 
 wake() {
@@ -333,6 +343,12 @@ auto_reconnect() {
 
 status() {
     local iface tooltip gap
+    if [ -f "$PORTAL_STATE" ]; then
+        reset_stale_count
+        tooltip="VPN: Captive portal login isolated\\nNormal host traffic remains blocked by leak protection\\nThe ephemeral portal browser will close automatically after login"
+        echo "{\"text\": \"󰖂\", \"class\": \"portal\", \"tooltip\": \"${tooltip}\"}"
+        return 0
+    fi
     iface="$(active_interface 2>/dev/null || true)"
     # Always refresh the poll timestamp; a large gap means we were asleep/frozen
     # and should reconnect now rather than waiting out the consecutive counter.
@@ -341,10 +357,10 @@ status() {
     if [ -n "$iface" ]; then
         if vpn_online "$iface"; then
             reset_stale_count
-            tooltip="VPN: Online (${iface})\\nConnectivity check passed through WireGuard\\nLeft-click to disconnect"
+            tooltip="VPN: Online (${iface})\\nConnectivity check passed through WireGuard\\nMiddle-click to disconnect"
             echo "{\"text\": \"󰖂\", \"class\": \"connected\", \"tooltip\": \"${tooltip}\"}"
         else
-            tooltip="VPN: Enabled but offline (${iface})\\n$(failure_message)\\nKill switch should block public fallback traffic\\nWill auto-reconnect after ${AUTORECONNECT_STALE_THRESHOLD} consecutive stale checks (sooner after sleep)\\nLeft-click to reconnect now; right-click to disconnect for portal login"
+            tooltip="VPN: Enabled but offline (${iface})\\n$(failure_message)\\nKill switch should block public fallback traffic\\nWill auto-reconnect after ${AUTORECONNECT_STALE_THRESHOLD} consecutive stale checks (sooner after sleep)\\nMiddle-click to reconnect; use 'make portal' for isolated login"
             echo "{\"text\": \"󰖂\", \"class\": \"stale\", \"tooltip\": \"${tooltip}\"}"
             # Do not bounce wg0 on one missed curl; require consecutive stale
             # polls so transient packet loss/DNS/check-server slowness doesn't
@@ -356,14 +372,14 @@ status() {
         fi
     else
         if kill_switch_intended_on; then
-            tooltip="VPN: Intended on but interface is missing\\n$(failure_message)\\nKill switch should block public fallback traffic\\nWill auto-reconnect after ${AUTORECONNECT_STALE_THRESHOLD} consecutive stale checks (sooner after sleep)\\nLeft-click to reconnect now; right-click to disconnect intentionally"
+            tooltip="VPN: Intended on but interface is missing\\n$(failure_message)\\nKill switch should block public fallback traffic\\nWill auto-reconnect after ${AUTORECONNECT_STALE_THRESHOLD} consecutive stale checks (sooner after sleep)\\nMiddle-click to reconnect; use 'make reset' to disconnect intentionally"
             echo "{\"text\": \"󰖂\", \"class\": \"stale\", \"tooltip\": \"${tooltip}\"}"
             if [ "$AUTORECONNECT" = "1" ] && { [ "$gap" = "1" ] || record_stale_check; }; then
                 nohup "$0" auto-reconnect >/dev/null 2>&1 &
             fi
         else
             reset_stale_count
-            printf '%s\n' '{"text": "󰖂", "class": "disconnected", "tooltip": "VPN: Disconnected\nLeft-click to connect"}'
+            printf '%s\n' '{"text": "󰖂", "class": "disconnected", "tooltip": "VPN: Disconnected\nMiddle-click to connect"}'
         fi
     fi
 }
