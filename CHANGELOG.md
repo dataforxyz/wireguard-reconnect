@@ -7,8 +7,10 @@ All notable changes to this project are documented here. The project follows
 
 ### Added
 
-- Added Make targets matching the Waybar status, toggle, disconnect, connect,
-  and reconnect controls, plus reset, diagnostics, logs, tests, and install.
+- Added Make targets for WireGuard status, toggle, disconnect, connect,
+  reconnect, reset, diagnostics, logs, tests, and install.
+- Documented a safer Waybar binding that reserves connect/disconnect toggling
+  for middle-click and leaves the easier-to-hit left and right buttons unbound.
 
 ### Fixed
 

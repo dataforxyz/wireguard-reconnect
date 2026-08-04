@@ -58,8 +58,9 @@ The installer:
 6. installs the system-sleep hook; and
 7. runs one immediate health/connection pass.
 
-The Waybar module should execute `wireguard-status`, left-click
-`wireguard-status toggle`, and right-click `wireguard-status disconnect`.
+The Waybar module should execute `wireguard-status` and bind only middle-click
+to `wireguard-status toggle`. Leaving left- and right-click unbound prevents an
+accidental connect or disconnect:
 
 ## Make commands
 
@@ -67,10 +68,20 @@ Run `make` or `make help` in this repository to list the available controls.
 The common commands mirror the Waybar icon and provide an explicit recovery
 path:
 
+```jsonc
+"custom/wireguard": {
+  "exec": "wireguard-status",
+  "return-type": "json",
+  "interval": 10,
+  "signal": 10,
+  "on-click-middle": "wireguard-status toggle"
+}
+```
+
 ```bash
 make status       # show the icon's current state
-make toggle       # same as left-clicking the icon
-make disconnect   # same as right-clicking the icon
+make toggle       # same as middle-clicking the icon
+make disconnect   # explicit intentional disconnect
 make connect      # explicitly connect wg0
 make reconnect    # explicitly bounce and reconnect wg0
 make reset        # clear stuck VPN intent and leak protection, even if wg0 is missing
@@ -88,7 +99,7 @@ make install      # sudo install/update of the system integration
 `make reset` is the captive-portal/emergency escape hatch. It intentionally
 leaves WireGuard off, disables the fail-closed guard, and verifies that direct
 internet traffic is available. Re-enable the VPN afterward with `make connect`
-or the Waybar icon.
+or middle-clicking the Waybar icon.
 
 Check the installed version with:
 

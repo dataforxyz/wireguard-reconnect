@@ -45,4 +45,6 @@ export XDG_RUNTIME_DIR="$TMP/run"
 "$REPO_DIR/wireguard-status" disconnect
 
 grep -Fxq "$TMP/bin/helper down wg0" "$STATUS_CALL_LOG"
-printf 'status missing-interface disconnect test: OK\n'
+! grep -Eq 'Left-click|Right-click|left-click|right-click' "$REPO_DIR/wireguard-status"
+grep -q 'Middle-click' "$REPO_DIR/wireguard-status"
+printf 'status missing-interface disconnect and safe-click tests: OK\n'

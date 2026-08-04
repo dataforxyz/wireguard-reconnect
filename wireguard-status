@@ -288,7 +288,7 @@ wake_monitor() {
     done
 
     refresh_waybar
-    notify -u critical "VPN still offline" "Captive portal may still be blocking WireGuard. Right-click the VPN icon to disconnect, finish login, then left-click to reconnect."
+    notify -u critical "VPN still offline" "Captive portal may still be blocking WireGuard. Run 'make reset' from wireguard-reconnect, finish login, then middle-click the VPN icon to reconnect."
 }
 
 wake() {
@@ -345,10 +345,10 @@ status() {
     if [ -n "$iface" ]; then
         if vpn_online "$iface"; then
             reset_stale_count
-            tooltip="VPN: Online (${iface})\\nConnectivity check passed through WireGuard\\nLeft-click to disconnect"
+            tooltip="VPN: Online (${iface})\\nConnectivity check passed through WireGuard\\nMiddle-click to disconnect"
             echo "{\"text\": \"󰖂\", \"class\": \"connected\", \"tooltip\": \"${tooltip}\"}"
         else
-            tooltip="VPN: Enabled but offline (${iface})\\n$(failure_message)\\nKill switch should block public fallback traffic\\nWill auto-reconnect after ${AUTORECONNECT_STALE_THRESHOLD} consecutive stale checks (sooner after sleep)\\nLeft-click to reconnect now; right-click to disconnect for portal login"
+            tooltip="VPN: Enabled but offline (${iface})\\n$(failure_message)\\nKill switch should block public fallback traffic\\nWill auto-reconnect after ${AUTORECONNECT_STALE_THRESHOLD} consecutive stale checks (sooner after sleep)\\nMiddle-click to reconnect; use 'make reset' for portal login"
             echo "{\"text\": \"󰖂\", \"class\": \"stale\", \"tooltip\": \"${tooltip}\"}"
             # Do not bounce wg0 on one missed curl; require consecutive stale
             # polls so transient packet loss/DNS/check-server slowness doesn't
@@ -360,14 +360,14 @@ status() {
         fi
     else
         if kill_switch_intended_on; then
-            tooltip="VPN: Intended on but interface is missing\\n$(failure_message)\\nKill switch should block public fallback traffic\\nWill auto-reconnect after ${AUTORECONNECT_STALE_THRESHOLD} consecutive stale checks (sooner after sleep)\\nLeft-click to reconnect now; right-click to disconnect intentionally"
+            tooltip="VPN: Intended on but interface is missing\\n$(failure_message)\\nKill switch should block public fallback traffic\\nWill auto-reconnect after ${AUTORECONNECT_STALE_THRESHOLD} consecutive stale checks (sooner after sleep)\\nMiddle-click to reconnect; use 'make reset' to disconnect intentionally"
             echo "{\"text\": \"󰖂\", \"class\": \"stale\", \"tooltip\": \"${tooltip}\"}"
             if [ "$AUTORECONNECT" = "1" ] && { [ "$gap" = "1" ] || record_stale_check; }; then
                 nohup "$0" auto-reconnect >/dev/null 2>&1 &
             fi
         else
             reset_stale_count
-            printf '%s\n' '{"text": "󰖂", "class": "disconnected", "tooltip": "VPN: Disconnected\nLeft-click to connect"}'
+            printf '%s\n' '{"text": "󰖂", "class": "disconnected", "tooltip": "VPN: Disconnected\nMiddle-click to connect"}'
         fi
     fi
 }

@@ -15,8 +15,8 @@ help:
 	@printf '%s\n' \
 	  'WireGuard controls:' \
 	  '  make status       Show the same state used by the Waybar icon' \
-	  '  make toggle       Same as left-clicking the Waybar icon' \
-	  '  make disconnect   Same as right-clicking the Waybar icon' \
+	  '  make toggle       Same as middle-clicking the Waybar icon' \
+	  '  make disconnect   Explicit intentional disconnect' \
 	  '  make connect      Explicitly connect WireGuard' \
 	  '  make reconnect    Bounce and reconnect WireGuard' \
 	  '  make reset        Clear VPN intent and the leak-protection guard' \
