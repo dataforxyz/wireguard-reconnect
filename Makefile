@@ -121,6 +121,9 @@ test:
 	@./tests/test-status.sh
 	@./tests/test-make-controls.sh
 	@./tests/test-portal.sh
+	@./tests/test-portal-probes.sh
+	@./tests/test-portal-session.sh
+	@./tests/test-auto-portal.sh
 	@./tests/test-version.sh
 
 install:

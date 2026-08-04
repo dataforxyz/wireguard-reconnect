@@ -3,6 +3,33 @@
 All notable changes to this project are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-08-04
+
+### Added
+
+- Automatically starts fail-closed captive-portal detection after a Wi-Fi
+  network event when the normal protected WireGuard reconnect remains offline.
+- Added serialized per-BSSID cooldown tracking plus a short global anti-popup
+  interval so repeated or rapidly changing AP identities cannot open windows in
+  a loop.
+- Added root-owned desktop-user discovery for safe automatic Wayland browser
+  launch and a no-root regression test for automatic dispatch and cooldown.
+- Cancels an active portal transaction if the physical default route, Wi-Fi
+  interface, gateway, BSSID, or active local graphical session changes during
+  login.
+
+### Security
+
+- Automatic detection uses the same isolated namespace, portal lock, restricted
+  nftables rules, staged endpoint candidate, verified teardown, and protected
+  reconnect path as the manual `make portal` command.
+- Automatic mode is Wi-Fi-only, rechecks VPN health while atomically holding
+  both monitor and privileged-helper action locks, targets only the active local
+  graphical session, and launches a
+  browser only after both independent checks return portal-like non-204 2xx/3xx
+  or 511 responses. Partial probe failures and server errors remain fail-closed
+  without opening a window.
+
 ## [1.1.0] - 2026-08-04
 
 ### Added
@@ -72,6 +99,7 @@ All notable changes to this project are documented here. The project follows
 - Critical failures are recorded in `/run/wireguard-reconnect.failure` and
   surfaced in the Waybar tooltip.
 
+[1.2.0]: https://github.com/dataforxyz/wireguard-reconnect/releases/tag/v1.2.0
 [1.1.0]: https://github.com/dataforxyz/wireguard-reconnect/releases/tag/v1.1.0
 [1.0.1]: https://github.com/dataforxyz/wireguard-reconnect/releases/tag/v1.0.1
 [1.0.0]: https://github.com/dataforxyz/wireguard-reconnect/releases/tag/v1.0.0

@@ -3,7 +3,7 @@
 Event-driven WireGuard recovery for a Linux laptop using iwd/systemd-networkd,
 with Waybar controls, a full-tunnel kill switch, and Tailscale route repair.
 
-Current release: **v1.1.0**
+Current release: **v1.2.0**
 
 ## Behavior
 
@@ -25,12 +25,13 @@ Current release: **v1.1.0**
   `wg0` is brought up, remains active while `wg0` is bounced, and is verified
   again afterward. A failed verification takes `wg0` down and leaves public
   traffic blocked.
-- **Captive portals without host leaks:** detects portal interception from a
-  dedicated network namespace, opens an ephemeral Chromium profile inside that
-  namespace, and allows only its DNS and web traffic over the Wi-Fi underlay.
-  Every normal host process remains blocked by the kill switch. After the portal
-  returns the expected HTTP 204, the namespace is destroyed and WireGuard is
-  restored and verified automatically.
+- **Automatic captive portals without host leaks:** after a Wi-Fi/AP/network
+  event, a failed protected reconnect automatically starts detection from a
+  dedicated network namespace. Only when independent probes indicate a portal
+  does it open an ephemeral Chromium profile inside that namespace and allow its
+  DNS/web traffic over the Wi-Fi underlay. Every normal host process remains
+  blocked by the kill switch. After login returns the expected HTTP 204s, the
+  namespace is destroyed and WireGuard is restored and verified automatically.
 
 ## Files
 
@@ -57,8 +58,9 @@ The installer:
 
 1. installs root helpers under `/usr/local/bin`;
 2. installs `wireguard-status` into the invoking user's `~/.local/bin`;
-3. installs a narrow polkit rule allowing that local active user to invoke only
-   `/usr/local/bin/wireguard-reconnect` without a password;
+3. records that desktop user's UID in the root-only automatic-portal identity
+   file and installs a narrow polkit rule allowing the local active user to
+   invoke only `/usr/local/bin/wireguard-reconnect` without a password;
 4. pre-arms and verifies the kill switch, persisting only the endpoint metadata
    needed for the next early boot;
 5. installs and enables the kill-switch, monitor, and startup services;
@@ -96,13 +98,31 @@ make reset        # EMERGENCY full bypass; disables leak protection
 
 ### Captive portals
 
-Use one command:
+The installed network monitor normally starts portal mode automatically after a
+new Wi-Fi connection or AP change when a protected WireGuard reconnect still
+cannot pass traffic. It identifies the active desktop user from the root-owned
+`/etc/wireguard-reconnect/portal-user` file written by the installer, verifies
+that user owns the active local graphical session, and launches the isolated
+browser only when both probes return concrete portal-like HTTP responses
+(non-204 2xx/3xx or status 511). DNS errors, timeouts, server errors, or one
+blocked check endpoint are treated as
+inconclusive and never open a browser. Repeat attempts on the same BSSID are
+rate-limited for five minutes; a different AP bypasses that per-AP cooldown
+after a short 30-second global anti-popup interval. A periodic guarded health
+check also catches portals connected before the Wayland session was available.
+
+If Wi-Fi disconnects, the default route/BSSID changes, or the selected desktop
+session becomes inactive or remote during login, the transaction cancels, tears
+down its isolated path, and returns fail-closed. The next network event evaluates
+the new AP and active local session.
+
+Manual fallback remains one command:
 
 ```bash
 make portal
 ```
 
-It performs the entire transaction automatically:
+Automatic and manual modes perform the same transaction:
 
 1. acquires a portal lock honored by every connect, disconnect, and reconnect
    action, then verifies the host-wide fail-closed nftables guard;
@@ -212,6 +232,10 @@ Environment variables may be supplied through systemd service drop-ins:
 - `WIREGUARD_INTERFACE=wg0`
 - `WIREGUARD_MONITOR_DEBOUNCE=5`
 - `WIREGUARD_MONITOR_STABILIZE_DELAY=2`
+- `WIREGUARD_AUTO_PORTAL=1`
+- `WIREGUARD_PORTAL_COOLDOWN=300`
+- `WIREGUARD_PORTAL_GLOBAL_COOLDOWN=30`
+- `WIREGUARD_PORTAL_USER_FILE=/etc/wireguard-reconnect/portal-user`
 - `WIREGUARD_STARTUP_WAIT=30`
 - `WIREGUARD_CHECK_URL=http://connectivitycheck.gstatic.com/generate_204`
 - `WIREGUARD_CHECK_TIMEOUT=4`
@@ -240,6 +264,7 @@ Run the unprivileged nftables-generation regression test with:
 ./tests/test-make-controls.sh
 ./tests/test-portal.sh
 ./tests/test-portal-netns.sh  # also run by the portal simulator when supported
+./tests/test-auto-portal.sh
 ./tests/simulate-captive-portal-container.sh  # optional; requires Docker
 ./tests/test-version.sh
 ```

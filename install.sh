@@ -26,7 +26,7 @@ if [ -z "$TARGET_HOME" ] || [ ! -d "$TARGET_HOME" ]; then
     exit 1
 fi
 
-for command in install systemctl ip wg wg-quick curl flock nft pkexec runuser; do
+for command in install systemctl loginctl ip iw wg wg-quick curl flock nft pkexec runuser; do
     command -v "$command" >/dev/null 2>&1 || {
         echo "Missing required command: $command" >&2
         exit 1
@@ -60,6 +60,7 @@ backup_if_present /etc/systemd/system/wireguard-monitor.service
 backup_if_present /etc/systemd/system/wireguard-autostart.service
 backup_if_present /etc/systemd/system/wireguard-killswitch.service
 backup_if_present /etc/polkit-1/rules.d/49-wireguard-reconnect.rules
+backup_if_present /etc/wireguard-reconnect/portal-user
 backup_if_present "$TARGET_HOME/.local/bin/wireguard-status"
 
 echo "Installing WireGuard reconnect v${PROJECT_VERSION} components..."
@@ -73,6 +74,10 @@ install -Dm755 "$SCRIPT_DIR/wireguard-reconnect-sleep" /usr/lib/systemd/system-s
 install -Dm644 "$SCRIPT_DIR/wireguard-monitor.service" /etc/systemd/system/wireguard-monitor.service
 install -Dm644 "$SCRIPT_DIR/wireguard-autostart.service" /etc/systemd/system/wireguard-autostart.service
 install -Dm644 "$SCRIPT_DIR/wireguard-killswitch.service" /etc/systemd/system/wireguard-killswitch.service
+
+install -d -m 0700 /etc/wireguard-reconnect
+install -m 0600 /dev/null /etc/wireguard-reconnect/portal-user
+printf '%s\n' "$(id -u "$TARGET_USER")" >/etc/wireguard-reconnect/portal-user
 
 install -d -m 0755 -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER")" "$TARGET_HOME/.local/bin"
 install -m 0755 -o "$TARGET_USER" -g "$(id -gn "$TARGET_USER")" \

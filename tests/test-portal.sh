@@ -18,6 +18,8 @@ grep -Fq 'Local captive portal simulation: PASS' <<<"$output"
 grep -Fq 'Production portal mode must run as root' "$REPO_DIR/wireguard-portal"
 grep -Fq 'WIREGUARD_PORTAL_LOCK_HELD' "$REPO_DIR/wireguard-reconnect"
 grep -Fq 'WIREGUARD_PORTAL_LOCK_HELD' "$REPO_DIR/wireguard-portal"
+grep -Fq 'WIREGUARD_RECONNECT_LOCK_HELD' "$REPO_DIR/wireguard-reconnect"
+grep -Fq 'WIREGUARD_RECONNECT_LOCK_HELD=1' "$REPO_DIR/wireguard-monitor"
 # shellcheck disable=SC2016 # Assert literal production-script source text.
 grep -Fq 'net.ipv4.conf.${HOST_IFACE}.forwarding' "$REPO_DIR/wireguard-portal"
 # shellcheck disable=SC2016 # Assert literal production-script source text.
@@ -27,6 +29,8 @@ if grep -Fq 'net.ipv4.ip_forward=1' "$REPO_DIR/wireguard-portal"; then
   exit 1
 fi
 grep -Fq 'cp.cloudflare.com/generate_204' "$REPO_DIR/wireguard-portal"
+grep -Fq 'physical network changed during portal login' "$REPO_DIR/wireguard-portal"
+grep -Fq 'install -m 0600 /dev/null /etc/wireguard-reconnect/portal-user' "$REPO_DIR/install.sh"
 grep -Fq 'portal_resources_present' "$REPO_DIR/wireguard-portal"
 # shellcheck disable=SC2016 # Assert literal production-script source text.
 grep -Fq 'physical interface $PHYSICAL_IFACE disappeared' "$REPO_DIR/wireguard-portal"
