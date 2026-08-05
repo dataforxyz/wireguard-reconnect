@@ -50,6 +50,7 @@ EOF
 
 cat >"$TMP/bin/getent" <<'EOF'
 #!/bin/bash
+[ -n "${GETENT_CALL_LOG:-}" ] && printf '%s\n' "$*" >>"$GETENT_CALL_LOG"
 if [ "${1:-}" = "ahostsv4" ] && [ -n "${GETENT_IPV4:-}" ]; then
   printf '%s STREAM %s\n' "$GETENT_IPV4" "${2:-host}"
   exit 0
@@ -69,6 +70,7 @@ export WG_KILLSWITCH_ENDPOINT_STATE_FILE="$TMP/run/endpoint"
 export WG_KILLSWITCH_PERSISTENT_STATE_DIR="$TMP/state"
 export WG_KILLSWITCH_PORTAL_CANDIDATE_STATE_FILE="$TMP/run/portal-candidate"
 export WG_KILLSWITCH_LOG_FILE="$TMP/run/killswitch.log"
+export GETENT_CALL_LOG="$TMP/run/getent-calls"
 
 cat >"$TMP/config/wg0.conf" <<'EOF'
 [Interface]
@@ -101,13 +103,18 @@ if grep -q 'policy accept' "$NFT_CAPTURE"; then
   echo "unexpected accept-default policy" >&2
   exit 1
 fi
-test -s "$TMP/state/endpoint"
+test ! -e "$TMP/state/endpoint"
 
 # When unprivileged user namespaces are available, ask the real nft parser to
 # validate the generated transaction inside a throwaway network namespace.
 if command -v unshare >/dev/null 2>&1 && unshare -Urn true 2>/dev/null; then
   unshare -Urn /usr/bin/nft -c -f "$NFT_CAPTURE"
 fi
+
+# A second, explicitly traffic-verified refresh is the only operation allowed
+# to promote the runtime endpoint into the persistent cache.
+WIREGUARD_ENDPOINT_VERIFIED=1 "$REPO_DIR/wg-killswitch" enable wg0
+test -s "$TMP/state/endpoint"
 
 "$REPO_DIR/wg-killswitch" disable
 test ! -e "$NFT_ACTIVE"
@@ -131,6 +138,33 @@ if "$REPO_DIR/wg-killswitch" status >/dev/null; then
   exit 1
 fi
 "$REPO_DIR/wg-killswitch" status-portal >/dev/null
+
+# A DNS answer obtained before any verified WG traffic may be used only as a
+# runtime endpoint allowlist candidate. It must not poison the persistent cache.
+export GETENT_IPV4=198.51.100.50
+"$REPO_DIR/wg-killswitch" enable wg0
+"$REPO_DIR/wg-killswitch" status >/dev/null
+grep -q '198.51.100.50.*udp dport 51820 accept' "$NFT_CAPTURE"
+test ! -e "$TMP/state/endpoint"
+unset GETENT_IPV4
+
+# With a guard already active, resume/reconnect must use the last verified
+# persistent endpoint before DNS. Public DNS is blocked by the guard and waiting
+# for it would consume the reconnect helper's entire timeout.
+cat >"$WG_KILLSWITCH_PERSISTENT_STATE_DIR/endpoint" <<'EOF'
+IFACE=wg0
+ENDPOINT_HOST=vpn.invalid
+ENDPOINT_PORT=51820
+ENDPOINT4=203.0.113.30
+ENDPOINT6=
+WG_MARK=0xca6c
+EOF
+: >"$GETENT_CALL_LOG"
+"$REPO_DIR/wg-killswitch" enable wg0
+"$REPO_DIR/wg-killswitch" status >/dev/null
+grep -q '203.0.113.30.*udp dport 51820 accept' "$NFT_CAPTURE"
+test ! -s "$GETENT_CALL_LOG"
+rm -f "$WG_KILLSWITCH_PERSISTENT_STATE_DIR/endpoint"
 
 # A portal DNS result is usable for the immediate protected bootstrap but must
 # not replace the last verified persistent cache before WG traffic succeeds.
@@ -166,5 +200,17 @@ test -e "$NFT_ACTIVE"
 grep -q 'hook output.*policy drop' "$NFT_CAPTURE"
 grep -q 'emergency block public non-WireGuard egress' "$NFT_CAPTURE"
 "$REPO_DIR/wg-killswitch" status-portal >/dev/null
+
+# The only append-style runtime log is bounded during long uptimes. Journald
+# handles its own rotation; reconnect and portal transaction logs are truncated
+# when each new transaction begins.
+for _ in 1 2 3 4 5; do
+  WG_KILLSWITCH_LOG_MAX_BYTES=1 WG_KILLSWITCH_LOG_KEEP_LINES=2 \
+    "$REPO_DIR/wg-killswitch" confirm
+done
+test "$(wc -l <"$WG_KILLSWITCH_LOG_FILE")" -le 2
+# shellcheck disable=SC2016 # Assert literal production-script source text.
+grep -Fq 'WIREGUARD_ENDPOINT_VERIFIED="$endpoint_verified"' "$REPO_DIR/wireguard-reconnect"
+grep -Fq 'if vpn_traffic_verified; then' "$REPO_DIR/wireguard-reconnect"
 
 printf 'kill-switch fail-closed tests: OK\n'

@@ -160,4 +160,5 @@ wait "$first" || true
 wait "$second" || true
 test "$(wc -l <"$TMP/run/calls")" -eq 1
 
+grep -Fq 'repair_if_needed "periodic Wi-Fi health check" &' "$REPO_DIR/wireguard-monitor"
 printf 'automatic Wi-Fi captive portal detection tests: OK\n'

@@ -3,6 +3,34 @@
 All notable changes to this project are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.2] - 2026-08-05
+
+### Added
+
+- Expanded `make logs` with monitor process metadata and the bounded
+  kill-switch runtime log, while relying on journald's normal automatic
+  rotation for durable history.
+- Bounded the append-style `/run/wg-killswitch.log` to 256 KiB/1000 recent
+  lines; reconnect and portal logs continue to reset per transaction and all
+  runtime logs disappear on reboot.
+
+### Fixed
+
+- Restored reliable suspend/resume and roaming reconnects by using the last
+  traffic-verified WireGuard endpoint cache before attempting DNS whenever the
+  active kill switch already blocks public resolver traffic. This prevents the
+  guard setup from consuming the reconnect helper's 15-second timeout.
+- Changed the periodic Wi-Fi health check to run the normal protected reconnect
+  path first and enter automatic portal mode only if that reconnect completes
+  but WireGuard traffic remains unavailable.
+- Prevented ordinary reconnects from consuming an unverified runtime portal DNS
+  candidate; that candidate remains restricted to the atomic post-login restore.
+- Deferred every new DNS-derived endpoint's persistent-cache promotion until
+  cryptographically protected WireGuard-routed HTTP traffic succeeds. Pre-arm
+  DNS may create only a runtime allowlist candidate.
+- Kept the 15-second nftables watchdog independent from potentially long portal
+  login transactions so guard verification continues throughout authentication.
+
 ## [1.2.1] - 2026-08-04
 
 ### Fixed
@@ -107,6 +135,7 @@ All notable changes to this project are documented here. The project follows
 - Critical failures are recorded in `/run/wireguard-reconnect.failure` and
   surfaced in the Waybar tooltip.
 
+[1.2.2]: https://github.com/dataforxyz/wireguard-reconnect/releases/tag/v1.2.2
 [1.2.1]: https://github.com/dataforxyz/wireguard-reconnect/releases/tag/v1.2.1
 [1.2.0]: https://github.com/dataforxyz/wireguard-reconnect/releases/tag/v1.2.0
 [1.1.0]: https://github.com/dataforxyz/wireguard-reconnect/releases/tag/v1.1.0

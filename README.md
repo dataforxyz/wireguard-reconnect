@@ -3,7 +3,7 @@
 Event-driven WireGuard recovery for a Linux laptop using iwd/systemd-networkd,
 with Waybar controls, a full-tunnel kill switch, and Tailscale route repair.
 
-Current release: **v1.2.1**
+Current release: **v1.2.2**
 
 ## Behavior
 
@@ -147,6 +147,11 @@ Automatic and manual modes perform the same transaction:
    per-interface forwarding settings, or permitting any other VPN action;
 10. reconnects WireGuard and verifies both the `wg0` route and real HTTP traffic.
 
+The same trust rule applies outside portal mode: newly resolved endpoint DNS can
+be used only as a runtime pre-arm candidate and is persisted only after an HTTP
+request succeeds through `wg0`. The independent kill-switch watchdog continues
+checking nftables every 15 seconds even while portal authentication is waiting.
+
 No regular host process receives direct underlay access. The browser has no
 normal profile, cookies, extensions, password manager, or sync state. Closing
 it early, pressing Ctrl-C, timing out, or encountering an error triggers cleanup
@@ -239,8 +244,19 @@ Environment variables may be supplied through systemd service drop-ins:
 - `WIREGUARD_STARTUP_WAIT=30`
 - `WIREGUARD_CHECK_URL=http://connectivitycheck.gstatic.com/generate_204`
 - `WIREGUARD_CHECK_TIMEOUT=4`
+- `WG_KILLSWITCH_LOG_MAX_BYTES=262144`
+- `WG_KILLSWITCH_LOG_KEEP_LINES=1000`
 
 ## Diagnostics
+
+The consolidated first check is:
+
+```bash
+make logs
+```
+
+It includes the current monitor process metadata, the last 400 relevant journal
+entries, and bounded runtime helper logs. More targeted commands are:
 
 ```bash
 systemctl status wireguard-killswitch.service wireguard-monitor.service wireguard-autostart.service
@@ -254,6 +270,14 @@ The latest privileged helper output is written to
 `/run/wireguard-reconnect.failure` and shown in the Waybar tooltip. Captive
 portal activity is written to `/run/wireguard-portal.log`, with active
 transaction metadata in `/run/wireguard-portal.active`.
+
+Log cleanup is automatic. Journald rotates and vacuums its own persistent or
+volatile journal according to the host's `systemd-journald` limits. All `/run`
+files disappear on reboot; during long uptimes the reconnect log is replaced on
+each action, the portal log is replaced on each transaction, and the only
+append-style helper log (`/run/wg-killswitch.log`) is locked and trimmed at 256
+KiB to its newest 1000 lines. These limits are configurable with the variables
+listed above.
 
 Run the unprivileged nftables-generation regression test with:
 

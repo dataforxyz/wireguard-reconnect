@@ -17,16 +17,31 @@ PERSISTENT_STATE_DIR="${WG_KILLSWITCH_PERSISTENT_STATE_DIR:-/var/lib/wg-killswit
 PERSISTENT_ENDPOINT_STATE_FILE="$PERSISTENT_STATE_DIR/endpoint"
 PORTAL_CANDIDATE_STATE_FILE="${WG_KILLSWITCH_PORTAL_CANDIDATE_STATE_FILE:-/run/wg-killswitch.portal-candidate}"
 LOG_FILE="${WG_KILLSWITCH_LOG_FILE:-/run/wg-killswitch.log}"
+LOG_MAX_BYTES="${WG_KILLSWITCH_LOG_MAX_BYTES:-262144}"
+LOG_KEEP_LINES="${WG_KILLSWITCH_LOG_KEEP_LINES:-1000}"
 WG_CONFIG_DIR="${WG_CONFIG_DIR:-/etc/wireguard}"
 DEFAULT_IFACE="${WIREGUARD_INTERFACE:-wg0}"
 PORTAL_HOST_IFACE="${WIREGUARD_PORTAL_HOST_IFACE:-wgportal0}"
 DEFAULT_WG_MARK="0xca6c"
 TAILSCALE_MARK_MASK="0x00ff0000"
 TAILSCALE_MARK_VALUE="0x00080000"
+[[ "$LOG_MAX_BYTES" =~ ^[0-9]+$ ]] || LOG_MAX_BYTES=262144
+[[ "$LOG_KEEP_LINES" =~ ^[0-9]+$ ]] || LOG_KEEP_LINES=1000
 
 log() {
-  printf '[%s] %s\n' "$(date -Is)" "$*" >> "$LOG_FILE"
-  logger -t wg-killswitch "$*" 2>/dev/null || true
+  local message="$*" size tmp
+  {
+    flock -x 200
+    printf '[%s] %s\n' "$(date -Is)" "$message" >>"$LOG_FILE"
+    size="$(stat -c '%s' "$LOG_FILE" 2>/dev/null || echo 0)"
+    if [[ "$size" =~ ^[0-9]+$ ]] && (( size > LOG_MAX_BYTES )); then
+      tmp="${LOG_FILE}.trim.$$"
+      tail -n "$LOG_KEEP_LINES" "$LOG_FILE" >"$tmp"
+      chmod 0644 "$tmp" 2>/dev/null || true
+      mv -f "$tmp" "$LOG_FILE"
+    fi
+  } 200>"${LOG_FILE}.lock"
+  logger -t wg-killswitch "$message" 2>/dev/null || true
 }
 
 state_value() {
@@ -202,8 +217,8 @@ EOF
 
 enable_rules() {
   local iface="$1" conf ep parsed host port mark ep4 ep6 ep4_first ep6_first
-  local cache_file cache_label cached_host cached_port cached4 cached6 tmp endpoint_rules4 endpoint_rules6 table_prelude
-  local unresolved=0 used_portal_candidate=0
+  local cached_host cached_port tmp endpoint_rules4 endpoint_rules6 table_prelude
+  local unresolved=0 used_portal_candidate=0 used_runtime_candidate=0 used_persistent_cache=0
   valid_iface "$iface" || { echo "Invalid interface: $iface" >&2; exit 2; }
   conf="$(conf_for_iface "$iface")"
   [[ -f "$conf" ]] || { echo "Missing WireGuard config: $conf" >&2; exit 2; }
@@ -240,34 +255,55 @@ enable_rules() {
     fi
   fi
 
+  # Once the guard is active, public DNS is intentionally unavailable. Reuse
+  # the last endpoint that was persisted only after verified WireGuard traffic
+  # before attempting a resolver call that can hang until the reconnect helper
+  # times out. This is the normal suspend/resume and roaming bootstrap path.
+  if [[ -z "$ep4" && -z "$ep6" ]] && has_table && [[ -r "$PERSISTENT_ENDPOINT_STATE_FILE" ]]; then
+    cached_host="$(state_value "$PERSISTENT_ENDPOINT_STATE_FILE" ENDPOINT_HOST)"
+    cached_port="$(state_value "$PERSISTENT_ENDPOINT_STATE_FILE" ENDPOINT_PORT)"
+    if [[ -n "$host" && "$host" == "$cached_host" && "$port" == "$cached_port" ]]; then
+      ep4="$(state_value "$PERSISTENT_ENDPOINT_STATE_FILE" ENDPOINT4)"
+      ep6="$(state_value "$PERSISTENT_ENDPOINT_STATE_FILE" ENDPOINT6)"
+      used_persistent_cache=1
+      log "using persistent endpoint cache before blocked DNS lookup: ${host}:${port}"
+    fi
+  fi
+
+  # On the second half of an up/reconnect transaction, the active ruleset's
+  # runtime endpoint state contains the same candidate already allowed by the
+  # pre-armed guard. Reuse it without promoting it; only verified WG traffic
+  # below is allowed to update the persistent cache.
+  if [[ -z "$ep4" && -z "$ep6" ]] && has_table && [[ -r "$ENDPOINT_STATE_FILE" ]]; then
+    cached_host="$(state_value "$ENDPOINT_STATE_FILE" ENDPOINT_HOST)"
+    cached_port="$(state_value "$ENDPOINT_STATE_FILE" ENDPOINT_PORT)"
+    if [[ -n "$host" && "$host" == "$cached_host" && "$port" == "$cached_port" ]]; then
+      ep4="$(state_value "$ENDPOINT_STATE_FILE" ENDPOINT4)"
+      ep6="$(state_value "$ENDPOINT_STATE_FILE" ENDPOINT6)"
+      used_runtime_candidate=1
+      log "reusing unverified runtime endpoint candidate without DNS: ${host}:${port}"
+    fi
+  fi
+
   if [[ -z "$ep4" && -z "$ep6" && -n "$host" ]]; then
+    log "attempting endpoint DNS resolution before guard refresh: ${host}:${port}"
     ep4="$(resolve_endpoint_ips "$host" 4 | csv_or_empty || true)"
     ep6="$(resolve_endpoint_ips "$host" 6 | csv_or_empty || true)"
   fi
 
-  # DNS may be unavailable during early boot or immediately after portal login.
-  # Prefer a root-owned runtime portal candidate, then the last verified
-  # persistent cache. Both must match the configured host and port.
-  if [[ -z "$ep4" && -z "$ep6" ]]; then
-    for cache_file in "$PORTAL_CANDIDATE_STATE_FILE" "$PERSISTENT_ENDPOINT_STATE_FILE"; do
-      [[ -r "$cache_file" ]] || continue
-      cached_host="$(state_value "$cache_file" ENDPOINT_HOST)"
-      cached_port="$(state_value "$cache_file" ENDPOINT_PORT)"
-      if [[ -n "$host" && "$host" == "$cached_host" && "$port" == "$cached_port" ]]; then
-        cached4="$(state_value "$cache_file" ENDPOINT4)"
-        cached6="$(state_value "$cache_file" ENDPOINT6)"
-        ep4="$cached4"
-        ep6="$cached6"
-        if [[ "$cache_file" == "$PORTAL_CANDIDATE_STATE_FILE" ]]; then
-          cache_label="portal candidate"
-          used_portal_candidate=1
-        else
-          cache_label="persistent endpoint cache"
-        fi
-        log "using $cache_label for protected bootstrap: ${host}:${port}"
-        break
-      fi
-    done
+  # DNS may also be unavailable before the first guard transaction completes.
+  # Fall back only to the last traffic-verified persistent cache. A runtime
+  # portal candidate is accepted exclusively by the explicit restore block
+  # above and cannot influence ordinary reconnects.
+  if [[ -z "$ep4" && -z "$ep6" && -r "$PERSISTENT_ENDPOINT_STATE_FILE" ]]; then
+    cached_host="$(state_value "$PERSISTENT_ENDPOINT_STATE_FILE" ENDPOINT_HOST)"
+    cached_port="$(state_value "$PERSISTENT_ENDPOINT_STATE_FILE" ENDPOINT_PORT)"
+    if [[ -n "$host" && "$host" == "$cached_host" && "$port" == "$cached_port" ]]; then
+      ep4="$(state_value "$PERSISTENT_ENDPOINT_STATE_FILE" ENDPOINT4)"
+      ep6="$(state_value "$PERSISTENT_ENDPOINT_STATE_FILE" ENDPOINT6)"
+      used_persistent_cache=1
+      log "using persistent endpoint cache after DNS failure: ${host}:${port}"
+    fi
   fi
 
   endpoint_rules4=""
@@ -371,12 +407,19 @@ EOF
     return 1
   fi
 
-  if (( used_portal_candidate )); then
-    log "enabled with unverified portal endpoint candidate; deferring persistent cache promotion"
-  else
+  if [[ "${WIREGUARD_ENDPOINT_VERIFIED:-0}" == "1" ]]; then
     install -d -m 0700 "$PERSISTENT_STATE_DIR"
     cp "$ENDPOINT_STATE_FILE" "$PERSISTENT_ENDPOINT_STATE_FILE"
     chmod 0600 "$PERSISTENT_ENDPOINT_STATE_FILE"
+    log "promoted endpoint cache after verified WireGuard traffic"
+  elif (( used_portal_candidate )); then
+    log "enabled with unverified portal endpoint candidate; deferring persistent cache promotion"
+  elif (( used_runtime_candidate )); then
+    log "enabled with unverified runtime endpoint candidate; deferring persistent cache promotion"
+  elif (( used_persistent_cache )); then
+    log "enabled with existing traffic-verified persistent endpoint cache"
+  else
+    log "enabled with DNS endpoint candidate; deferring persistent cache promotion until WireGuard traffic is verified"
   fi
   log "enabled and verified iface=$iface endpoint=${host}:${port} ep4=${ep4:-none} ep6=${ep6:-none} mark=$mark"
 }

@@ -87,7 +87,11 @@ logs:
 	  -t wireguard-reconnect \
 	  -t wireguard-monitor \
 	  -t wireguard-portal \
-	  -b --no-pager -n 200
+	  -b --no-pager -n 400
+	@printf '\n-- monitor process --\n'
+	@systemctl show wireguard-monitor.service -p ActiveState -p SubState -p ActiveEnterTimestamp -p MainPID || true
+	@printf '\n-- /run/wg-killswitch.log --\n'
+	@tail -n 100 /run/wg-killswitch.log 2>/dev/null || true
 	@printf '\n-- /run/wireguard-reconnect.log --\n'
 	@tail -n 50 /run/wireguard-reconnect.log 2>/dev/null || true
 	@printf '\n-- /run/wireguard-reconnect.failure --\n'
