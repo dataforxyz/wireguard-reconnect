@@ -17,11 +17,25 @@ WAYBAR_SIGNAL="${WAYBAR_WIREGUARD_SIGNAL:-RTMIN+10}"
 # only read it for tooltips/error messages.
 LOG_FILE="/run/wireguard-reconnect.log"
 FAILURE_STATE="/run/wireguard-reconnect.failure"
+KILLSWITCH_STATE="${WIREGUARD_KILLSWITCH_STATE:-/run/wg-killswitch.enabled}"
+INTENT_STATE="${WIREGUARD_INTENT_STATE:-/run/wireguard-reconnect.enabled}"
 PORTAL_STATE="${WIREGUARD_PORTAL_STATE:-/run/wireguard-portal.active}"
 RECONNECT_HELPER="${WIREGUARD_RECONNECT_HELPER:-/usr/local/bin/wireguard-reconnect}"
-# Self-heal: when the interface is up but offline, attempt a hands-free
-# reconnect straight from the Waybar poll instead of waiting for a manual click.
-AUTORECONNECT="${WIREGUARD_AUTORECONNECT:-1}"
+# Self-heal: when enabled, an offline interface can be repaired from the Waybar
+# poll without waiting for a manual click. Installer-owned public flags make the
+# same opt-out apply to the monitor, wake hook, and Waybar path.
+AUTORECONNECT_FILE="${WIREGUARD_AUTORECONNECT_FILE:-/usr/local/share/wireguard-reconnect/automatic-reconnect-enabled}"
+AUTORECONNECT="${WIREGUARD_AUTORECONNECT:-}"
+if [ -z "$AUTORECONNECT" ] && [ -r "$AUTORECONNECT_FILE" ]; then
+    AUTORECONNECT="$(head -n1 "$AUTORECONNECT_FILE" 2>/dev/null || true)"
+fi
+[ "$AUTORECONNECT" = "0" ] || AUTORECONNECT=1
+PORTAL_ENABLED_FILE="${WIREGUARD_PORTAL_ENABLED_FILE:-/usr/local/share/wireguard-reconnect/captive-portal-enabled}"
+PORTAL_ENABLED="${WIREGUARD_PORTAL_ENABLED:-}"
+if [ -z "$PORTAL_ENABLED" ] && [ -r "$PORTAL_ENABLED_FILE" ]; then
+    PORTAL_ENABLED="$(head -n1 "$PORTAL_ENABLED_FILE" 2>/dev/null || true)"
+fi
+[ "$PORTAL_ENABLED" = "0" ] || PORTAL_ENABLED=1
 AUTORECONNECT_COOLDOWN="${WIREGUARD_AUTORECONNECT_COOLDOWN:-120}"
 AUTORECONNECT_STALE_THRESHOLD="${WIREGUARD_AUTORECONNECT_STALE_THRESHOLD:-4}"
 # Waybar polls this script every ~10s. A gap much larger than that between two
@@ -84,7 +98,11 @@ physical_interfaces() {
 }
 
 kill_switch_intended_on() {
-    [ -f /run/wg-killswitch.enabled ]
+    [ -f "$KILLSWITCH_STATE" ]
+}
+
+vpn_intended_on() {
+    [ -f "$INTENT_STATE" ]
 }
 
 underlay_online() {
@@ -258,6 +276,8 @@ reconnect() {
 
 wake_monitor() {
     local lock_dir lock_file active_iface attempt
+    [ "$AUTORECONNECT" = "1" ] || exit 0
+    vpn_intended_on || exit 0
     lock_dir="${XDG_RUNTIME_DIR:-/tmp}"
     lock_file="$lock_dir/wireguard-status-wake.lock"
 
@@ -272,7 +292,7 @@ wake_monitor() {
             # with the default interface name instead of exiting and requiring a
             # manual click. Intentional disconnect disables the kill switch, so
             # this does not undo a user-requested disconnect.
-            if kill_switch_intended_on; then
+            if vpn_intended_on; then
                 active_iface="$INTERFACE"
             else
                 refresh_waybar
@@ -287,7 +307,7 @@ wake_monitor() {
 
         if underlay_online; then
             notify "VPN" "Network is back; reconnecting WireGuard"
-            run_wg_action reconnect "$active_iface"
+            run_wg_action auto-reconnect "$active_iface"
             exit $?
         fi
 
@@ -304,6 +324,7 @@ wake_monitor() {
 }
 
 wake() {
+    [ "$AUTORECONNECT" = "1" ] || exit 0
     # Return immediately to hypridle; the monitor may wait for Wi-Fi/captive
     # portal completion before reconnecting.
     WIREGUARD_WAKE_BACKGROUND=0 nohup "$0" wake-monitor >/dev/null 2>&1 &
@@ -316,6 +337,8 @@ wake() {
 # fight each other.
 auto_reconnect() {
     local lock_dir lock_file stamp_file now last active_iface
+    [ "$AUTORECONNECT" = "1" ] || exit 0
+    vpn_intended_on || exit 0
     lock_dir="${XDG_RUNTIME_DIR:-/tmp}"
     lock_file="$lock_dir/wireguard-status-wake.lock"
     stamp_file="$lock_dir/wireguard-status-autoreconnect.stamp"
@@ -332,7 +355,7 @@ auto_reconnect() {
     # reconnect it automatically. If the user intentionally disconnected, the
     # helper disabled the kill switch, so leave it disconnected.
     if [ -z "$active_iface" ]; then
-        if kill_switch_intended_on; then
+        if vpn_intended_on; then
             active_iface="$INTERFACE"
         else
             exit 0
@@ -343,12 +366,29 @@ auto_reconnect() {
 
     printf '%s\n' "$now" >"$stamp_file"
     notify "VPN" "Connection stale; reconnecting WireGuard automatically"
-    run_wg_action reconnect "$active_iface"
+    run_wg_action auto-reconnect "$active_iface"
     exit $?
 }
 
 status() {
-    local iface tooltip gap
+    local iface tooltip gap guard_hint auto_hint portal_hint
+    if kill_switch_intended_on; then
+        guard_hint="Kill switch is armed against public fallback"
+    else
+        guard_hint="Kill switch is not armed"
+    fi
+    if [ "$AUTORECONNECT" = "1" ] && vpn_intended_on; then
+        auto_hint="Will auto-reconnect after ${AUTORECONNECT_STALE_THRESHOLD} consecutive stale checks (sooner after sleep)"
+    elif [ "$AUTORECONNECT" = "1" ]; then
+        auto_hint="Automatic reconnect awaits explicit connection intent"
+    else
+        auto_hint="Automatic reconnect is disabled"
+    fi
+    if [ "$PORTAL_ENABLED" = "1" ]; then
+        portal_hint="use 'make portal' for isolated login"
+    else
+        portal_hint="captive-portal support is disabled"
+    fi
     if [ -f "$PORTAL_STATE" ]; then
         reset_stale_count
         tooltip="VPN: Captive portal login isolated\\nNormal host traffic remains blocked by leak protection\\nThe ephemeral portal browser will close automatically after login"
@@ -366,26 +406,31 @@ status() {
             tooltip="VPN: Online (${iface})\\nConnectivity check passed through WireGuard\\nMiddle-click to disconnect"
             echo "{\"text\": \"󰖂\", \"class\": \"connected\", \"tooltip\": \"${tooltip}\"}"
         else
-            tooltip="VPN: Enabled but offline (${iface})\\n$(failure_message)\\nKill switch should block public fallback traffic\\nWill auto-reconnect after ${AUTORECONNECT_STALE_THRESHOLD} consecutive stale checks (sooner after sleep)\\nMiddle-click to reconnect; use 'make portal' for isolated login"
+            tooltip="VPN: Enabled but offline (${iface})\\n$(failure_message)\\n${guard_hint}\\n${auto_hint}\\nMiddle-click to reconnect; ${portal_hint}"
             echo "{\"text\": \"󰖂\", \"class\": \"stale\", \"tooltip\": \"${tooltip}\"}"
             # Do not bounce wg0 on one missed curl; require consecutive stale
             # polls so transient packet loss/DNS/check-server slowness doesn't
             # cause repeated full reconnects. A large poll gap (suspend/freeze)
             # bypasses the counter since the prior checks are no longer relevant.
-            if [ "$AUTORECONNECT" = "1" ] && { [ "$gap" = "1" ] || record_stale_check; }; then
+            if [ "$AUTORECONNECT" = "1" ] && vpn_intended_on && \
+               { [ "$gap" = "1" ] || record_stale_check; }; then
                 nohup "$0" auto-reconnect >/dev/null 2>&1 &
             fi
         fi
     else
-        if kill_switch_intended_on; then
-            tooltip="VPN: Intended on but interface is missing\\n$(failure_message)\\nKill switch should block public fallback traffic\\nWill auto-reconnect after ${AUTORECONNECT_STALE_THRESHOLD} consecutive stale checks (sooner after sleep)\\nMiddle-click to reconnect; use 'make reset' to disconnect intentionally"
+        if vpn_intended_on; then
+            tooltip="VPN: Intended on but interface is missing\\n$(failure_message)\\n${guard_hint}\\n${auto_hint}\\nMiddle-click to reconnect; use 'make reset' to disconnect intentionally"
             echo "{\"text\": \"󰖂\", \"class\": \"stale\", \"tooltip\": \"${tooltip}\"}"
             if [ "$AUTORECONNECT" = "1" ] && { [ "$gap" = "1" ] || record_stale_check; }; then
                 nohup "$0" auto-reconnect >/dev/null 2>&1 &
             fi
         else
             reset_stale_count
-            printf '%s\n' '{"text": "󰖂", "class": "disconnected", "tooltip": "VPN: Disconnected\nMiddle-click to connect"}'
+            if kill_switch_intended_on; then
+                printf '%s\n' '{"text": "󰖂", "class": "disconnected", "tooltip": "VPN: Disconnected; kill switch is armed\nMiddle-click to connect, or use make disconnect to remove the guard"}'
+            else
+                printf '%s\n' '{"text": "󰖂", "class": "disconnected", "tooltip": "VPN: Disconnected\nMiddle-click to connect"}'
+            fi
         fi
     fi
 }

@@ -1,7 +1,8 @@
 # wireguard-reconnect
 
-Event-driven WireGuard recovery for a Linux laptop using iwd/systemd-networkd,
-with Waybar controls, a full-tunnel kill switch, and optional Tailscale route repair.
+WireGuard controls and optional recovery automation for a Linux laptop using
+iwd/systemd-networkd, with Waybar integration, an opt-out full-tunnel kill
+switch, opt-out reconnect/boot/portal automation, and opt-in Tailscale repair.
 
 Current release: **v1.3.0-beta.1**
 
@@ -13,6 +14,11 @@ Current release: **v1.3.0-beta.1**
 Licensed under **GPL-3.0-or-later**.
 
 ## Behavior
+
+The default install enables the complete fail-closed experience below for
+backward compatibility. The kill switch, automatic reconnect, boot connection,
+captive-portal support, automatic portal detection, and immediate installer
+connection are independently selectable; see [Install](#install).
 
 - **Before normal networking at boot:** pre-arms a fail-closed nftables guard
   using a root-only cached WireGuard endpoint.
@@ -73,12 +79,13 @@ normal VPN actions resume.
 | WireGuard | `wg-quick`, full-tunnel `wg0` | Interface may be overridden |
 | Wi-Fi/network stack | IPv4 underlay with iwd + systemd-networkd | Other netlink-compatible stacks and IPv6-only underlays are untested |
 | Desktop | Wayland + Waybar | CLI controls work without Waybar; automatic browser launch requires an active local Wayland session |
-| Browser | Chromium, Brave, or Google Chrome | Firefox is not currently supported by portal isolation |
+| Browser | Chromium, Brave, or Google Chrome | Required only when captive-portal support is enabled; Firefox is not currently supported by portal isolation |
 | Distribution | Arch Linux / Omarchy | Other systemd distributions require dependency/path validation |
 | Tailscale | Optional, explicit opt-in | Existing rules are preserved; a tracked rule is added only when required |
 
-Required commands include `systemctl`, `loginctl`, `ip`, `iw`, `wg`, `wg-quick`,
-`curl`, `flock`, `nft`, `pkexec`, and `runuser`.
+Core commands include `systemctl`, `ip`, `wg`, `wg-quick`, `curl`, `flock`,
+`nft`, and `pkexec`. Captive-portal support additionally requires `loginctl`,
+`iw`, `runuser`, `resolvectl`, `sysctl`, `setsid`, and a supported browser.
 
 ## Files
 
@@ -114,27 +121,59 @@ Confirm that `/etc/wireguard/wg0.conf` already works with `wg-quick` and include
 sudo ./install.sh
 ```
 
-Install-time options are explicit and root-persisted:
+Install-time options are explicit and root-persisted. All feature flags accept
+`0` or `1`; omitted flags use these defaults on first install and retain their
+recorded value on later upgrades:
+
+| Option | Default |
+|---|---:|
+| `ENABLE_KILLSWITCH` | `1` |
+| `ENABLE_AUTOMATIC_RECONNECT` | `1` |
+| `ENABLE_AUTOSTART` | `1` |
+| `ENABLE_CAPTIVE_PORTAL` | `1` |
+| `ENABLE_AUTO_PORTAL` | `1` |
+| `CONNECT_ON_INSTALL` | `1` |
+| `ENABLE_TAILSCALE_INTEGRATION` | `0` |
+
+For example, install controls only and leave WireGuard entirely manual:
 
 ```bash
-sudo INSTALL_INTERFACE=wg1 ./install.sh
-sudo ENABLE_TAILSCALE_INTEGRATION=1 ./install.sh
+sudo ENABLE_KILLSWITCH=0 \
+  ENABLE_AUTOMATIC_RECONNECT=0 \
+  ENABLE_AUTOSTART=0 \
+  ENABLE_CAPTIVE_PORTAL=0 \
+  CONNECT_ON_INSTALL=0 \
+  ./install.sh
 ```
 
-The default authorized interface is `wg0`; the passwordless helper rejects all
-other `wgN` profiles so their root-owned `wg-quick` hooks cannot be triggered.
-Tailscale integration is disabled by default and never runs `tailscale up`.
-Re-running the installer with integration disabled removes only the tracked rule
-previously added by this project.
+Or keep fail-closed manual operation without automatic reconnect, boot connect,
+or portal detection:
+
+```bash
+sudo ENABLE_AUTOMATIC_RECONNECT=0 \
+  ENABLE_AUTOSTART=0 \
+  ENABLE_AUTO_PORTAL=0 \
+  CONNECT_ON_INSTALL=0 \
+  ./install.sh
+```
+
+The default authorized interface is `wg0`; use `INSTALL_INTERFACE=wg1` to
+change it. The passwordless helper rejects other `wgN` profiles. Captive-portal
+handling requires the kill switch, so opting out of the guard also disables the
+portal feature. Tailscale integration is disabled by default and never runs
+`tailscale up`. See the [installer option matrix](docs/installer.md#preconditions-and-options)
+for dependency behavior, safety implications, and reconfiguration.
 
 Detailed operator documentation:
 
 - [Installer and rollback model](docs/installer.md)
 - [Tailscale integration and bypass scope](docs/tailscale.md)
 
-The installer serializes portal/reconnect actions, pre-arms the guard, performs
-protected interface migration, verifies real WireGuard traffic, and restores
-prior interface, guard, files, services, and tracked policy rules on failure.
+The installer serializes portal/reconnect actions and applies only the selected
+components. With default options it pre-arms the guard, performs protected
+interface migration, and verifies real WireGuard traffic. Every configuration
+retains transactional restoration of prior interface, guard, files, services,
+and tracked policy rules on failure.
 Backups are written under `/var/backups/wireguard-reconnect-*` with mode `0700`.
 
 ### Uninstall
@@ -246,8 +285,8 @@ Release checklist:
 
 Environment variables may be supplied through systemd service drop-ins:
 
-The authorized interface and Tailscale integration are install-time settings;
-re-run the installer to change them. Runtime service drop-ins may adjust:
+The authorized interface, feature policy, and Tailscale integration are persisted
+install-time settings; re-run the installer to change them. Runtime service drop-ins may adjust:
 
 - `WIREGUARD_MONITOR_DEBOUNCE=5`
 - `WIREGUARD_MONITOR_STABILIZE_DELAY=2`
@@ -290,7 +329,7 @@ mode, forwarded traffic from the root-created `wgportal0` veth is additionally
 limited to DNS and web ports; all other traffic from that namespace is rejected
 before the normal private/LAN forwarding exception. An intentional emergency
 **disconnect/reset** still removes the guard completely; the next system boot
-restores the default-on guarded policy. Because LAN/private, Tailscale, DHCP,
+restores it only when the installed kill-switch policy remains enabled. Because LAN/private, Tailscale, DHCP,
 and local bridge exceptions are intentional, the kill switch is not isolation
 from hostile devices or proxies reachable through those permitted local paths.
 

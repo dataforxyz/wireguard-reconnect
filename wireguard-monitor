@@ -18,6 +18,7 @@ INTENT_STATE="${WIREGUARD_INTENT_STATE:-/run/wireguard-reconnect.enabled}"
 KILLSWITCH_STATE="${WIREGUARD_KILLSWITCH_STATE:-/run/wg-killswitch.enabled}"
 RECONNECT_HELPER="${WIREGUARD_RECONNECT_HELPER:-/usr/local/bin/wireguard-reconnect}"
 KILLSWITCH_HELPER="${WIREGUARD_KILLSWITCH_HELPER:-/usr/local/bin/wg-killswitch}"
+KILLSWITCH_ENABLED="${WIREGUARD_KILLSWITCH:-1}"
 FAILURE_STATE="${WIREGUARD_FAILURE_STATE:-/run/wireguard-reconnect.failure}"
 PORTAL_STATE="${WIREGUARD_PORTAL_STATE:-/run/wireguard-portal.active}"
 AUTO_PORTAL="${WIREGUARD_AUTO_PORTAL:-1}"
@@ -45,7 +46,10 @@ log() {
 }
 
 vpn_intended_on() {
-    [ -f "$INTENT_STATE" ] || [ -f "$KILLSWITCH_STATE" ] || ip link show "$IFACE" >/dev/null 2>&1
+    # Autostart explicitly recreates intent at boot. The guard's own state is
+    # not connection intent: this distinction lets boot connection be disabled
+    # while retaining an early fail-closed policy.
+    [ -f "$INTENT_STATE" ] || ip link show "$IFACE" >/dev/null 2>&1
 }
 
 underlay_online() {
@@ -150,7 +154,7 @@ maybe_auto_portal() (
     portal_cooldown_ready "$fingerprint" || return 1
 
     log "$reason: WireGuard is still offline on Wi-Fi; starting isolated captive-portal detection"
-    if PKEXEC_UID="$uid" WIREGUARD_RECONNECT_LOCK_HELD=1 "$RECONNECT_HELPER" portal "$IFACE"; then
+    if PKEXEC_UID="$uid" WIREGUARD_RECONNECT_LOCK_HELD=1 "$RECONNECT_HELPER" auto-portal "$IFACE"; then
         log "$reason: captive-portal transaction completed with protected connectivity"
         return 0
     fi
@@ -187,7 +191,7 @@ repair_if_needed() {
     fi
 
     log "$reason: $IFACE is stale or missing; running $action"
-    if "$RECONNECT_HELPER" "$action" "$IFACE"; then
+    if "$RECONNECT_HELPER" "auto-$action" "$IFACE"; then
         sleep "$STABILIZE_DELAY"
         if vpn_online; then
             log "$reason: $IFACE $action completed and traffic is verified"
@@ -216,8 +220,11 @@ trigger_repair() {
 
 guard_watchdog() {
     local now
+    [ "$KILLSWITCH_ENABLED" = "1" ] || return 0
     while sleep "$GUARD_CHECK_INTERVAL"; do
-        vpn_intended_on || continue
+        # Intentional disconnect removes the guard state. Do not turn a
+        # verified user-requested bypass back into a guarded policy.
+        [ -f "$KILLSWITCH_STATE" ] || continue
         [ -x "$KILLSWITCH_HELPER" ] || continue
 
         # Use a subshell so the lock fd is always closed after this check.
@@ -227,6 +234,8 @@ guard_watchdog() {
             local message status_action="status"
             exec 8>"$RECONNECT_LOCK"
             flock -n 8 || exit 0
+            # Close the state-check/lock race with intentional disconnect.
+            [ -f "$KILLSWITCH_STATE" ] || exit 0
 
             [ -f "$PORTAL_STATE" ] && status_action="status-portal"
             if "$KILLSWITCH_HELPER" "$status_action" >/dev/null 2>&1; then
@@ -278,9 +287,12 @@ fi
 # A service restart after resume gets an immediate health check even if the
 # relevant netlink event happened just before the monitor started reading.
 trigger_repair "monitor start/resume"
-guard_watchdog &
-WATCHDOG_PID=$!
-trap 'kill "$WATCHDOG_PID" 2>/dev/null || true' EXIT INT TERM
+WATCHDOG_PID=""
+if [ "$KILLSWITCH_ENABLED" = "1" ]; then
+    guard_watchdog &
+    WATCHDOG_PID=$!
+fi
+trap '[ -z "$WATCHDOG_PID" ] || kill "$WATCHDOG_PID" 2>/dev/null || true' EXIT INT TERM
 
 ip monitor route link address | while IFS= read -r line; do
     case "$line" in

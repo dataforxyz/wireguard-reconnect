@@ -110,7 +110,8 @@ remove_installed_files() {
 
 remove_runtime_state() {
     rm -f \
-        /run/wireguard-reconnect.enabled /run/wireguard-reconnect.failure /run/wireguard-reconnect.log \
+        /run/wireguard-reconnect.enabled /run/wireguard-reconnect.autostart-suppressed \
+        /run/wireguard-reconnect.failure /run/wireguard-reconnect.log \
         /run/wireguard-reconnect.tailscale-rules \
         /run/wg-killswitch.enabled /run/wg-killswitch.endpoint /run/wg-killswitch.portal-candidate \
         /run/wg-killswitch.log /run/wg-killswitch.log.lock /run/wg-killswitch.rollback-token \

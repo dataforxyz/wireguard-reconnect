@@ -109,7 +109,7 @@ if ! command -v unshare >/dev/null 2>&1 || ! unshare -Ur true 2>/dev/null; then
 fi
 
 run_monitor
-grep -Fxq 'uid=1000 inherited=1 args=portal wg0' "$TMP/run/calls"
+grep -Fxq 'uid=1000 inherited=1 args=auto-portal wg0' "$TMP/run/calls"
 [ "$(stat -c '%a' "$TMP/run/stamp")" = "600" ]
 
 # Same BSSID is rate-limited.

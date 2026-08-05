@@ -24,7 +24,9 @@ trap 'rm -f "$used" "$required"' EXIT
 for file in "${production[@]}"; do
   grep -Eo '/usr/bin/[A-Za-z0-9._+-]+' "$file" || true
 done | sort -u >"$used"
-awk '/required_paths=\(/,/^\)/' install.sh |
+sed -n \
+  -e '/required_paths=(/,/^)/p' \
+  -e '/required_paths+=(/,/^[[:space:]]*)/p' install.sh |
   grep -Eo '/usr/bin/[A-Za-z0-9._+-]+' | sort -u >"$required"
 while IFS= read -r path; do
   case "$path" in
@@ -78,6 +80,28 @@ if grep -Fq 'tailscale up' wireguard-reconnect; then
   echo "Tailscale integration must not reconfigure the daemon" >&2
   exit 1
 fi
+
+# Every optional feature remains explicit, persisted, and documented. Optional
+# units must not pull disabled companions back in through Wants= dependencies.
+options=(
+  ENABLE_KILLSWITCH ENABLE_AUTOMATIC_RECONNECT ENABLE_AUTOSTART
+  ENABLE_CAPTIVE_PORTAL ENABLE_AUTO_PORTAL CONNECT_ON_INSTALL
+  ENABLE_TAILSCALE_INTEGRATION
+)
+for option in "${options[@]}"; do
+  grep -Fq "$option" install.sh || { echo "installer option missing: $option" >&2; exit 1; }
+  grep -Fq "$option" docs/installer.md || { echo "installer option undocumented: $option" >&2; exit 1; }
+done
+if grep -Eq '^Wants=.*wireguard-killswitch' wireguard-monitor.service; then
+  echo 'monitor must not pull the optional kill-switch unit' >&2
+  exit 1
+fi
+if grep -Eq '^Wants=.*(wireguard-killswitch|wireguard-monitor)' wireguard-autostart.service; then
+  echo 'autostart must not pull optional companion units' >&2
+  exit 1
+fi
+grep -Fq 'automatic-reconnect-enabled' wireguard-status
+grep -Fq 'captive-portal-enabled' wireguard-reconnect
 
 # Keep the front page navigable; detailed operator material belongs in docs/.
 [ "$(wc -l <README.md)" -le 350 ] || {

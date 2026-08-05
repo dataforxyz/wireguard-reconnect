@@ -1,6 +1,13 @@
 # Captive-portal workflow
 
-The monitor starts portal handling only after a protected WireGuard reconnect
+Captive-portal support is enabled by default but can be removed from the active
+policy with `ENABLE_CAPTIVE_PORTAL=0`. Keep manual isolated portal handling but
+disable automatic detection with `ENABLE_AUTO_PORTAL=0`. The workflow requires
+the kill switch; `ENABLE_KILLSWITCH=0` automatically disables portal support.
+Re-run the installer to change these persisted choices.
+
+When automatic detection is enabled, the monitor starts portal handling only
+after a protected WireGuard reconnect
 still cannot pass traffic on Wi-Fi. Manual fallback uses the same transaction:
 
 ```bash

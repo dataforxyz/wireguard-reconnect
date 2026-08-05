@@ -8,8 +8,10 @@ set -u
 
 IFACE="${WIREGUARD_INTERFACE:-wg0}"
 INTENT_STATE="${WIREGUARD_INTENT_STATE:-/run/wireguard-reconnect.enabled}"
+SUPPRESS_STATE="${WIREGUARD_AUTOSTART_SUPPRESS_STATE:-/run/wireguard-reconnect.autostart-suppressed}"
 RECONNECT_HELPER="${WIREGUARD_RECONNECT_HELPER:-/usr/local/bin/wireguard-reconnect}"
 STARTUP_WAIT="${WIREGUARD_STARTUP_WAIT:-30}"
+RETRY_IF_LATE="${WIREGUARD_AUTOSTART_RETRY:-0}"
 
 log() {
     logger -t wireguard-autostart "$*" 2>/dev/null || true
@@ -20,6 +22,11 @@ underlay_online() {
     ip -4 route show table main default 2>/dev/null | \
         awk '$0 !~ / dev (wg[0-9]*|tailscale[0-9]*|tun[0-9]*|tap[0-9]*)/ { found=1 } END { exit !found }'
 }
+
+if [ -f "$SUPPRESS_STATE" ]; then
+    log "Intentional disconnect is active for this boot; leaving $IFACE off"
+    exit 0
+fi
 
 install -d -m 0755 "$(dirname "$INTENT_STATE")"
 printf '%s\n' "$IFACE" >"$INTENT_STATE"
@@ -35,13 +42,18 @@ for ((attempt = 0; attempt <= STARTUP_WAIT; attempt++)); do
             exit 0
         fi
         log "Physical network ready; enabling $IFACE by default"
-        "$RECONNECT_HELPER" up "$IFACE"
+        "$RECONNECT_HELPER" auto-up "$IFACE"
         exit $?
     fi
     sleep 1
 done
 
-# Keep the intent marker. wireguard-monitor will connect on the next physical
-# route/address event instead of failing the boot because Wi-Fi was late.
+# Keep the intent marker. With automatic reconnect enabled, the monitor handles
+# the next physical route event. When the monitor is explicitly disabled, ask
+# systemd to retry this bounded oneshot until the boot connection succeeds.
+if [ "$RETRY_IF_LATE" = "1" ]; then
+    log "No physical default route after ${STARTUP_WAIT}s; scheduling another boot-connect attempt"
+    exit 1
+fi
 log "No physical default route after ${STARTUP_WAIT}s; waiting for network monitor"
 exit 0

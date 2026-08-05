@@ -20,10 +20,22 @@ LOCK_FILE="/run/wireguard-reconnect.lock"
 INSTALL_LOCK_FILE="${WIREGUARD_INSTALL_LOCK_FILE:-/run/wireguard-reconnect.install.lock}"
 INSTALL_LOCK_TIMEOUT="${WIREGUARD_INSTALL_LOCK_TIMEOUT:-30}"
 INTENT_STATE="${WIREGUARD_INTENT_STATE:-/run/wireguard-reconnect.enabled}"
+AUTOSTART_SUPPRESS_STATE="${WIREGUARD_AUTOSTART_SUPPRESS_STATE:-/run/wireguard-reconnect.autostart-suppressed}"
 KILLSWITCH_HELPER="/usr/local/bin/wg-killswitch"
 PORTAL_HELPER="/usr/local/bin/wireguard-portal"
 PORTAL_STATE="/run/wireguard-portal.active"
-KILLSWITCH_ENABLED="${WIREGUARD_KILLSWITCH:-1}"
+KILLSWITCH_ENABLED_FILE="${WIREGUARD_KILLSWITCH_ENABLED_FILE:-/etc/wireguard-reconnect/killswitch-enabled}"
+KILLSWITCH_ENABLED="${WIREGUARD_KILLSWITCH:-}"
+if [ -z "$KILLSWITCH_ENABLED" ] && [ -r "$KILLSWITCH_ENABLED_FILE" ]; then
+    KILLSWITCH_ENABLED="$(head -n1 "$KILLSWITCH_ENABLED_FILE" 2>/dev/null || true)"
+fi
+[ "$KILLSWITCH_ENABLED" = "0" ] || KILLSWITCH_ENABLED=1
+PORTAL_ENABLED_FILE="${WIREGUARD_PORTAL_ENABLED_FILE:-/etc/wireguard-reconnect/captive-portal-enabled}"
+PORTAL_ENABLED="${WIREGUARD_PORTAL_ENABLED:-}"
+if [ -z "$PORTAL_ENABLED" ] && [ -r "$PORTAL_ENABLED_FILE" ]; then
+    PORTAL_ENABLED="$(head -n1 "$PORTAL_ENABLED_FILE" 2>/dev/null || true)"
+fi
+[ "$PORTAL_ENABLED" = "0" ] || PORTAL_ENABLED=1
 KILLSWITCH_STATE="/run/wg-killswitch.enabled"
 KILLSWITCH_ENDPOINT_STATE="/run/wg-killswitch.endpoint"
 PORTAL_ENDPOINT_CANDIDATE="/run/wg-killswitch.portal-candidate"
@@ -70,6 +82,12 @@ case "$ACTION" in
         print_version
         exit 0
         ;;
+esac
+AUTOMATIC_ACTION=0
+case "$ACTION" in
+    auto-up) ACTION=up; AUTOMATIC_ACTION=1 ;;
+    auto-reconnect) ACTION=reconnect; AUTOMATIC_ACTION=1 ;;
+    auto-portal) ACTION=portal; AUTOMATIC_ACTION=1 ;;
 esac
 
 # Public desktop actions take a shared transaction lock. Install/uninstall hold
@@ -171,6 +189,23 @@ critical() {
 clear_failure() {
     rm -f "$FAILURE_STATE"
 }
+
+# Automatic callers may have decided to connect before waiting on the install
+# or action lock. Recheck intent only after owning every transaction lock so an
+# install-time defer or intentional disconnect cancels queued work.
+if [ "$AUTOMATIC_ACTION" = "1" ] && [ ! -f "$INTENT_STATE" ]; then
+    echo "[#] automatic $ACTION cancelled because connection intent was cleared" >>"$LOG_FILE"
+    exit 3
+fi
+if [ "$AUTOMATIC_ACTION" != "1" ] && \
+   { [ "$ACTION" = "up" ] || [ "$ACTION" = "reconnect" ] || [ "$ACTION" = "portal" ]; }; then
+    rm -f "$AUTOSTART_SUPPRESS_STATE"
+fi
+
+if [ "$ACTION" = "portal" ] && [ "$PORTAL_ENABLED" != "1" ]; then
+    critical "captive-portal support is disabled by installer configuration"
+    exit 1
+fi
 
 # This runtime marker records intent independently of interface health. A
 # deliberate disconnect clears it; boot recreates it because VPN-on is the
@@ -385,6 +420,8 @@ case "$ACTION" in
             fi
         fi
         rm -f "$INTENT_STATE"
+        printf '%s\n' "$IFACE" >"$AUTOSTART_SUPPRESS_STATE"
+        chmod 0644 "$AUTOSTART_SUPPRESS_STATE" 2>/dev/null || true
         ;;
     reconnect)
         echo "[#] wg-quick down $IFACE" >>"$LOG_FILE"

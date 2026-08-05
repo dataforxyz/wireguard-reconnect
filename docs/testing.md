@@ -12,14 +12,15 @@ The suite covers:
 
 - nftables policy-drop generation, emergency fallback, endpoint provenance,
   deletion/query failures, and rollback timers;
-- boot autostart idempotency;
+- boot autostart idempotency and separation of monitor repair from boot connection intent;
 - status/Waybar middle-click safety;
 - Make control dispatch;
 - portal orchestration, probe classification, active-session restrictions,
   cooldowns, and concurrency;
 - fresh install success/failure, interface migration success/exact-state
-  rollback, Tailscale opt-out, and successful/fail-closed uninstall inside a
-  disposable user/mount namespace;
+  rollback, Tailscale opt-out, full manual/minimal option combinations,
+  guarded-without-connect installation, and successful/fail-closed uninstall
+  inside a disposable user/mount namespace;
 - public-release security contracts and version consistency; and
 - maintenance contracts tying installed artifacts, services, documentation, and
   installer preflight together.

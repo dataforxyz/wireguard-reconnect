@@ -76,8 +76,13 @@ while [ "$#" -gt 0 ]; do
 done
 echo "curl $iface" >>"$MOCK_STATE/events"
 if [ "${MOCK_CURL_FAIL:-0}" = "1" ] || [ -z "$iface" ] || \
-   [ ! -e "$MOCK_STATE/link-$iface" ] || [ ! -e "$MOCK_STATE/nft-active" ] || \
-   ! grep -Fq "oifname \"$iface\" accept" "$MOCK_STATE/nft-rules"; then
+   [ ! -e "$MOCK_STATE/link-$iface" ]; then
+  printf '000'
+  exit 28
+fi
+if [ "${EXPECT_KILLSWITCH:-1}" = "1" ] && \
+   { [ ! -e "$MOCK_STATE/nft-active" ] || \
+     ! grep -Fq "oifname \"$iface\" accept" "$MOCK_STATE/nft-rules"; }; then
   printf '000'
   exit 28
 fi
@@ -171,6 +176,9 @@ case "$command" in
     ;;
   disable)
     for arg in "$@"; do
+      if [ -n "${MOCK_SYSTEMCTL_DISABLE_FAIL:-}" ] && [ "$arg" = "$MOCK_SYSTEMCTL_DISABLE_FAIL" ]; then
+        exit 1
+      fi
       [[ "$arg" == -* ]] || rm -f "$MOCK_STATE/enabled-$arg" "$MOCK_STATE/active-$arg"
     done
     ;;
@@ -248,7 +256,7 @@ mount --bind "$home_src" "$TEST_HOME"
 trap 'chown -R 0:0 "$CASE_ROOT" 2>/dev/null || true' EXIT
 
 export PATH="$CASE_ROOT/mocks:/usr/bin:/bin"
-if [[ "$TEST_MODE" == migration* || "$TEST_MODE" == tailscale-optout ]]; then
+if [[ "$TEST_MODE" == migration* || "$TEST_MODE" == tailscale-optout || "$TEST_MODE" == optout-disable-failure ]]; then
   mkdir -p /usr/local/bin
   cat >/usr/local/bin/wg-killswitch <<'EOF'
 #!/bin/bash
@@ -279,6 +287,9 @@ EOF
   : >"$MOCK_STATE/active-wireguard-autostart.service"
   : >"$MOCK_STATE/enabled-wireguard-autostart.service"
   : >"$MOCK_STATE/enabled-wireguard-killswitch.service"
+  printf 'prior-portal-stamp\n' >/run/wireguard-portal.autodetect
+  printf 'prior-portal-candidate\n' >/run/wg-killswitch.portal-candidate
+  chmod 0600 /run/wireguard-portal.autodetect /run/wg-killswitch.portal-candidate
 fi
 if [ "$TEST_MODE" = tailscale-optout ]; then
   printf '1\n' >/etc/wireguard-reconnect/tailscale-enabled
@@ -288,7 +299,70 @@ if [ "$TEST_MODE" = tailscale-optout ]; then
 fi
 
 export SUDO_USER="$TEST_USER" INSTALL_INTERFACE="$TEST_INTERFACE" ENABLE_TAILSCALE_INTEGRATION=0
-export MOCK_STATE TEST_USER TEST_UID TEST_GID TEST_HOME TEST_INTERFACE
+export ENABLE_KILLSWITCH=1 ENABLE_AUTOMATIC_RECONNECT=1 ENABLE_AUTOSTART=1
+export ENABLE_CAPTIVE_PORTAL=1 ENABLE_AUTO_PORTAL=1 CONNECT_ON_INSTALL=1 EXPECT_KILLSWITCH=1
+if [ "$TEST_MODE" = options-persist ]; then
+  install -d -m 0700 /etc/wireguard-reconnect
+  for option_file in killswitch-enabled automatic-reconnect-enabled autostart-enabled \
+      captive-portal-enabled auto-portal-enabled connect-on-install; do
+    printf '0\n' >"/etc/wireguard-reconnect/$option_file"
+    chmod 0600 "/etc/wireguard-reconnect/$option_file"
+  done
+  unset ENABLE_KILLSWITCH ENABLE_AUTOMATIC_RECONNECT ENABLE_AUTOSTART
+  unset ENABLE_CAPTIVE_PORTAL ENABLE_AUTO_PORTAL CONNECT_ON_INSTALL
+  export EXPECT_KILLSWITCH=0
+fi
+if [ "$TEST_MODE" = options-invalid ]; then
+  install -d -m 0700 /etc/wireguard-reconnect
+  printf 'invalid\n' >/etc/wireguard-reconnect/killswitch-enabled
+  chmod 0600 /etc/wireguard-reconnect/killswitch-enabled
+  unset ENABLE_KILLSWITCH
+fi
+case "$TEST_MODE" in
+  migration-failure)
+    export ENABLE_CAPTIVE_PORTAL=0 ENABLE_AUTO_PORTAL=0
+    ;;
+  minimal)
+    export ENABLE_KILLSWITCH=0 ENABLE_AUTOMATIC_RECONNECT=0 ENABLE_AUTOSTART=0
+    export ENABLE_CAPTIVE_PORTAL=0 ENABLE_AUTO_PORTAL=0 CONNECT_ON_INSTALL=0 EXPECT_KILLSWITCH=0
+    ;;
+  manual-no-guard)
+    export ENABLE_KILLSWITCH=0 ENABLE_AUTOMATIC_RECONNECT=0 ENABLE_AUTOSTART=0
+    export ENABLE_CAPTIVE_PORTAL=0 ENABLE_AUTO_PORTAL=0 CONNECT_ON_INSTALL=1 EXPECT_KILLSWITCH=0
+    ;;
+  kill-only-optout)
+    export ENABLE_KILLSWITCH=0 EXPECT_KILLSWITCH=0
+    ;;
+  auto-reconnect-optout)
+    export ENABLE_AUTOMATIC_RECONNECT=0
+    ;;
+  optout-disable-failure)
+    export ENABLE_KILLSWITCH=0 ENABLE_CAPTIVE_PORTAL=0 EXPECT_KILLSWITCH=0
+    export MOCK_SYSTEMCTL_DISABLE_FAIL=wireguard-killswitch.service
+    ;;
+  guarded-manual)
+    export ENABLE_AUTOMATIC_RECONNECT=0 ENABLE_AUTOSTART=0 ENABLE_CAPTIVE_PORTAL=0
+    export ENABLE_AUTO_PORTAL=0 CONNECT_ON_INSTALL=0
+    ;;
+  no-boot-connect)
+    export ENABLE_AUTOSTART=0 CONNECT_ON_INSTALL=0
+    ;;
+  boot-only)
+    export ENABLE_KILLSWITCH=0 ENABLE_AUTOMATIC_RECONNECT=0 ENABLE_AUTOSTART=1
+    export ENABLE_CAPTIVE_PORTAL=0 ENABLE_AUTO_PORTAL=0 CONNECT_ON_INSTALL=0 EXPECT_KILLSWITCH=0
+    ;;
+esac
+if [ "$TEST_MODE" = no-boot-connect ]; then
+  printf 'wg0\n' >/run/wireguard-reconnect.enabled
+fi
+if [ "$TEST_MODE" = minimal ] || [ "$TEST_MODE" = kill-only-optout ]; then
+  for portal_command in iw loginctl runuser resolvectl sysctl setsid; do
+    umount "/usr/bin/$portal_command" 2>/dev/null || true
+    rm -f "/usr/bin/$portal_command"
+  done
+fi
+export MOCK_STATE TEST_USER TEST_UID TEST_GID TEST_HOME TEST_INTERFACE EXPECT_KILLSWITCH
+export MOCK_SYSTEMCTL_DISABLE_FAIL="${MOCK_SYSTEMCTL_DISABLE_FAIL:-}"
 if [ "$TEST_MODE" = failure ] || [ "$TEST_MODE" = migration-failure ]; then export MOCK_CURL_FAIL=1; fi
 
 set +e
@@ -344,6 +418,10 @@ case "$TEST_MODE" in
     [ "$(stat -c '%a' /etc/polkit-1/rules.d/49-wireguard-reconnect.rules)" = 640 ]
     grep -Fxq 'prior-user-status' "$TEST_HOME/.local/bin/wireguard-status"
     [ "$(stat -c '%a' "$TEST_HOME/.local/bin/wireguard-status")" = 700 ]
+    grep -Fxq 'prior-portal-stamp' /run/wireguard-portal.autodetect
+    grep -Fxq 'prior-portal-candidate' /run/wg-killswitch.portal-candidate
+    [ "$(stat -c '%a' /run/wireguard-portal.autodetect)" = 600 ]
+    [ "$(stat -c '%a' /run/wg-killswitch.portal-candidate)" = 600 ]
     [ -e "$MOCK_STATE/nft-active" ]
     [ -e "$MOCK_STATE/active-wireguard-monitor.service" ]
     [ -e "$MOCK_STATE/enabled-wireguard-monitor.service" ]
@@ -357,6 +435,126 @@ case "$TEST_MODE" in
     [ ! -e /run/wireguard-reconnect.tailscale-rules ]
     grep -Fq -- '-4 rule del pref 5200 to 100.64.0.0/10 lookup 52' "$MOCK_STATE/ip-calls"
     grep -Fxq '0' /etc/wireguard-reconnect/tailscale-enabled
+    ;;
+  minimal)
+    [ "$rc" -eq 0 ]
+    [ ! -e "$MOCK_STATE/link-wg0" ]
+    [ ! -e "$MOCK_STATE/nft-active" ]
+    [ ! -e "$MOCK_STATE/enabled-wireguard-killswitch.service" ]
+    [ ! -e "$MOCK_STATE/enabled-wireguard-monitor.service" ]
+    [ ! -e "$MOCK_STATE/enabled-wireguard-autostart.service" ]
+    grep -Fxq '0' /etc/wireguard-reconnect/killswitch-enabled
+    grep -Fxq '0' /etc/wireguard-reconnect/automatic-reconnect-enabled
+    grep -Fxq '0' /etc/wireguard-reconnect/autostart-enabled
+    grep -Fxq '0' /etc/wireguard-reconnect/captive-portal-enabled
+    grep -Fxq '0' /usr/local/share/wireguard-reconnect/automatic-reconnect-enabled
+    set +e
+    /usr/local/bin/wireguard-reconnect portal wg0 >/dev/null 2>&1
+    portal_rc=$?
+    set -e
+    [ "$portal_rc" -ne 0 ]
+    [ ! -e /run/wireguard-reconnect.enabled ]
+    [ ! -e /run/wireguard-portal.active ]
+    ;;
+  manual-no-guard)
+    [ "$rc" -eq 0 ]
+    [ -e "$MOCK_STATE/link-wg0" ]
+    [ ! -e "$MOCK_STATE/nft-active" ]
+    [ -e /run/wireguard-reconnect.enabled ]
+    [ ! -e "$MOCK_STATE/active-wireguard-killswitch.service" ]
+    [ ! -e "$MOCK_STATE/active-wireguard-monitor.service" ]
+    [ ! -e "$MOCK_STATE/active-wireguard-autostart.service" ]
+    ;;
+  kill-only-optout)
+    [ "$rc" -eq 0 ]
+    [ -e "$MOCK_STATE/link-wg0" ]
+    [ ! -e "$MOCK_STATE/nft-active" ]
+    grep -Fxq '0' /etc/wireguard-reconnect/killswitch-enabled
+    grep -Fxq '0' /etc/wireguard-reconnect/captive-portal-enabled
+    grep -Fxq '0' /etc/wireguard-reconnect/auto-portal-enabled
+    [ -e "$MOCK_STATE/active-wireguard-monitor.service" ]
+    [ -e "$MOCK_STATE/active-wireguard-autostart.service" ]
+    ;;
+  auto-reconnect-optout)
+    [ "$rc" -eq 0 ]
+    [ -e "$MOCK_STATE/link-wg0" ]
+    [ -e "$MOCK_STATE/nft-active" ]
+    grep -Fxq '0' /etc/wireguard-reconnect/automatic-reconnect-enabled
+    grep -Fxq '0' /etc/wireguard-reconnect/auto-portal-enabled
+    [ ! -e "$MOCK_STATE/active-wireguard-monitor.service" ]
+    [ -e "$MOCK_STATE/active-wireguard-autostart.service" ]
+    ;;
+  optout-disable-failure)
+    [ "$rc" -ne 0 ]
+    [ -e "$MOCK_STATE/link-wg0" ]
+    [ -e "$MOCK_STATE/nft-active" ]
+    [ -e "$MOCK_STATE/enabled-wireguard-killswitch.service" ]
+    grep -Fq 'prior-helper-sentinel' /usr/local/bin/wg-killswitch
+    grep -Fxq 'wg0' /etc/wireguard-reconnect/interface
+    grep -Fq 'Rollback complete' "$CASE_ROOT/install.out"
+    ;;
+  guarded-manual)
+    [ "$rc" -eq 0 ]
+    [ ! -e "$MOCK_STATE/link-wg0" ]
+    [ -e "$MOCK_STATE/nft-active" ]
+    [ -e "$MOCK_STATE/active-wireguard-killswitch.service" ]
+    [ -e "$MOCK_STATE/enabled-wireguard-killswitch.service" ]
+    [ ! -e "$MOCK_STATE/active-wireguard-monitor.service" ]
+    [ ! -e "$MOCK_STATE/active-wireguard-autostart.service" ]
+    ;;
+  no-boot-connect)
+    [ "$rc" -eq 0 ]
+    [ ! -e "$MOCK_STATE/link-wg0" ]
+    [ -e "$MOCK_STATE/nft-active" ]
+    [ -e "$MOCK_STATE/enabled-wireguard-monitor.service" ]
+    [ ! -e "$MOCK_STATE/active-wireguard-monitor.service" ]
+    [ ! -e "$MOCK_STATE/enabled-wireguard-autostart.service" ]
+    [ ! -e /run/wireguard-reconnect.enabled ]
+    [ -e /run/wireguard-reconnect.autostart-suppressed ]
+    set +e
+    /usr/local/bin/wireguard-reconnect auto-up wg0 >/dev/null 2>&1
+    auto_rc=$?
+    set -e
+    [ "$auto_rc" -eq 3 ]
+    [ ! -e "$MOCK_STATE/link-wg0" ]
+    ;;
+  disconnect-suppresses-auto)
+    [ "$rc" -eq 0 ]
+    /usr/local/bin/wireguard-reconnect down wg0
+    [ ! -e "$MOCK_STATE/link-wg0" ]
+    [ ! -e "$MOCK_STATE/nft-active" ]
+    [ ! -e /run/wireguard-reconnect.enabled ]
+    [ -e /run/wireguard-reconnect.autostart-suppressed ]
+    set +e
+    /usr/local/bin/wireguard-reconnect auto-up wg0 >/dev/null 2>&1
+    auto_rc=$?
+    set -e
+    [ "$auto_rc" -eq 3 ]
+    [ ! -e "$MOCK_STATE/link-wg0" ]
+    ;;
+  boot-only)
+    [ "$rc" -eq 0 ]
+    [ ! -e "$MOCK_STATE/link-wg0" ]
+    [ ! -e "$MOCK_STATE/nft-active" ]
+    [ -e "$MOCK_STATE/enabled-wireguard-autostart.service" ]
+    [ ! -e "$MOCK_STATE/active-wireguard-autostart.service" ]
+    [ ! -e "$MOCK_STATE/enabled-wireguard-monitor.service" ]
+    ;;
+  options-persist)
+    [ "$rc" -eq 0 ]
+    [ ! -e "$MOCK_STATE/link-wg0" ]
+    [ ! -e "$MOCK_STATE/nft-active" ]
+    grep -Fxq '0' /etc/wireguard-reconnect/killswitch-enabled
+    grep -Fxq '0' /etc/wireguard-reconnect/automatic-reconnect-enabled
+    grep -Fxq '0' /etc/wireguard-reconnect/autostart-enabled
+    grep -Fxq '0' /etc/wireguard-reconnect/captive-portal-enabled
+    grep -Fxq '0' /etc/wireguard-reconnect/connect-on-install
+    ;;
+  options-invalid)
+    [ "$rc" -ne 0 ]
+    [ ! -e /usr/local/bin/wireguard-reconnect ]
+    [ ! -e "$MOCK_STATE/nft-active" ]
+    grep -Fq 'Invalid persisted installer option' "$CASE_ROOT/install.out"
     ;;
   uninstall)
     [ "$rc" -eq 0 ]
@@ -379,10 +577,12 @@ case "$TEST_MODE" in
     ;;
 esac
 [ ! -e /run/wg-killswitch.rollback-token ]
-if [[ "$TEST_MODE" != *failure && "$TEST_MODE" != uninstall ]]; then
-  [ -e "$MOCK_STATE/active-wireguard-monitor.service" ]
-  [ -e "$MOCK_STATE/active-wireguard-autostart.service" ]
-fi
+case "$TEST_MODE" in
+  success|migration|tailscale-optout)
+    [ -e "$MOCK_STATE/active-wireguard-monitor.service" ]
+    [ -e "$MOCK_STATE/active-wireguard-autostart.service" ]
+    ;;
+esac
 INNER
   then
     echo "installer namespace transaction test failed: $mode" >&2
@@ -403,6 +603,17 @@ run_case failure
 run_case migration
 run_case migration-failure
 run_case tailscale-optout
+run_case minimal
+run_case manual-no-guard
+run_case kill-only-optout
+run_case auto-reconnect-optout
+run_case optout-disable-failure
+run_case guarded-manual
+run_case no-boot-connect
+run_case disconnect-suppresses-auto
+run_case boot-only
+run_case options-persist
+run_case options-invalid
 run_case uninstall
 run_case uninstall-failure
 printf 'installer namespace transaction test: OK\n'

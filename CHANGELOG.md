@@ -5,6 +5,12 @@ All notable public changes are documented here. The project follows
 
 ## [Unreleased]
 
+### Added
+
+- Added persisted installer opt-outs for the kill switch, automatic reconnect,
+  boot connection, captive-portal support, automatic portal detection, and the
+  install-time connection. Defaults preserve the existing full feature set.
+
 ### Changed
 
 - Refactored installer and uninstaller orchestration into named internal phases

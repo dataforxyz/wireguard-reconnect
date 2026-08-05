@@ -49,11 +49,59 @@ INTERFACE="${INSTALL_INTERFACE:-${WIREGUARD_INTERFACE:-wg0}}"
     echo "Missing WireGuard config: /etc/wireguard/${INTERFACE}.conf" >&2
     exit 1
 }
-TAILSCALE_ENABLED="${ENABLE_TAILSCALE_INTEGRATION:-0}"
-[ "$TAILSCALE_ENABLED" = "0" ] || [ "$TAILSCALE_ENABLED" = "1" ] || {
-    echo "ENABLE_TAILSCALE_INTEGRATION must be 0 or 1" >&2
-    exit 1
+persisted_option_default() {
+    local file="$1" fallback="$2" value=""
+    if [ ! -e "$file" ]; then
+        printf '%s\n' "$fallback"
+        return 0
+    fi
+    if ! { [ -f "$file" ] && [ ! -L "$file" ] && \
+        [ "$(stat -c '%u' "$file")" = "0" ] && \
+        [ $((8#$(stat -c '%a' "$file") & 0022)) -eq 0 ]; }; then
+        echo "Unsafe persisted installer option: $file" >&2
+        return 1
+    fi
+    value="$(head -n1 "$file" 2>/dev/null || true)"
+    [ "$value" = "0" ] || [ "$value" = "1" ] || {
+        echo "Invalid persisted installer option: $file" >&2
+        return 1
+    }
+    printf '%s\n' "$value"
 }
+TAILSCALE_ENABLED="${ENABLE_TAILSCALE_INTEGRATION:-$(persisted_option_default /etc/wireguard-reconnect/tailscale-enabled 0)}"
+KILLSWITCH_ENABLED="${ENABLE_KILLSWITCH:-$(persisted_option_default /etc/wireguard-reconnect/killswitch-enabled 1)}"
+AUTOMATIC_RECONNECT_ENABLED="${ENABLE_AUTOMATIC_RECONNECT:-$(persisted_option_default /etc/wireguard-reconnect/automatic-reconnect-enabled 1)}"
+AUTOSTART_ENABLED="${ENABLE_AUTOSTART:-$(persisted_option_default /etc/wireguard-reconnect/autostart-enabled 1)}"
+CAPTIVE_PORTAL_ENABLED="${ENABLE_CAPTIVE_PORTAL:-$(persisted_option_default /etc/wireguard-reconnect/captive-portal-enabled 1)}"
+AUTO_PORTAL_ENABLED="${ENABLE_AUTO_PORTAL:-$(persisted_option_default /etc/wireguard-reconnect/auto-portal-enabled 1)}"
+CONNECT_ON_INSTALL_ENABLED="${CONNECT_ON_INSTALL:-$(persisted_option_default /etc/wireguard-reconnect/connect-on-install 1)}"
+validate_boolean_option() {
+    local name="$1" value="$2"
+    [ "$value" = "0" ] || [ "$value" = "1" ] || {
+        echo "$name must be 0 or 1" >&2
+        exit 1
+    }
+}
+validate_boolean_option ENABLE_TAILSCALE_INTEGRATION "$TAILSCALE_ENABLED"
+validate_boolean_option ENABLE_KILLSWITCH "$KILLSWITCH_ENABLED"
+validate_boolean_option ENABLE_AUTOMATIC_RECONNECT "$AUTOMATIC_RECONNECT_ENABLED"
+validate_boolean_option ENABLE_AUTOSTART "$AUTOSTART_ENABLED"
+validate_boolean_option ENABLE_CAPTIVE_PORTAL "$CAPTIVE_PORTAL_ENABLED"
+validate_boolean_option ENABLE_AUTO_PORTAL "$AUTO_PORTAL_ENABLED"
+validate_boolean_option CONNECT_ON_INSTALL "$CONNECT_ON_INSTALL_ENABLED"
+if [ "$CAPTIVE_PORTAL_ENABLED" = "1" ] && [ "$KILLSWITCH_ENABLED" != "1" ]; then
+    echo "Captive-portal support disabled because its isolated workflow requires the kill switch." >&2
+    CAPTIVE_PORTAL_ENABLED=0
+fi
+if [ "$AUTO_PORTAL_ENABLED" = "1" ] && \
+   { [ "$CAPTIVE_PORTAL_ENABLED" != "1" ] || [ "$AUTOMATIC_RECONNECT_ENABLED" != "1" ]; }; then
+    echo "Automatic portal detection disabled because it requires the captive portal, kill switch, and automatic reconnect." >&2
+    AUTO_PORTAL_ENABLED=0
+fi
+AUTOSTART_RETRY=0
+if [ "$AUTOSTART_ENABLED" = "1" ] && [ "$AUTOMATIC_RECONNECT_ENABLED" = "0" ]; then
+    AUTOSTART_RETRY=1
+fi
 
 if [ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}" ] && [ "${ALLOW_REMOTE_INSTALL:-0}" != "1" ]; then
     echo "Refusing remote installation: firewall changes can interrupt SSH." >&2
@@ -62,27 +110,34 @@ if [ -n "${SSH_CONNECTION:-}${SSH_CLIENT:-}" ] && [ "${ALLOW_REMOTE_INSTALL:-0}"
 fi
 
 required_paths=(
-    /usr/bin/install /usr/bin/systemctl /usr/bin/loginctl /usr/bin/ip /usr/bin/iw
+    /usr/bin/install /usr/bin/systemctl /usr/bin/ip
     /usr/bin/wg /usr/bin/wg-quick /usr/bin/curl /usr/bin/flock /usr/bin/nft
-    /usr/bin/pkexec /usr/bin/runuser /usr/bin/resolvectl /usr/bin/sysctl
-    /usr/bin/getent /usr/bin/timeout /usr/bin/setsid /usr/bin/logger
+    /usr/bin/pkexec /usr/bin/getent /usr/bin/timeout /usr/bin/logger
     /usr/bin/find /usr/bin/awk /usr/bin/sed /usr/bin/tail /usr/bin/stat
     /usr/bin/pkill /usr/bin/grep /usr/bin/seq /usr/bin/cp /usr/bin/mkdir
     /usr/bin/rm /usr/bin/dirname /usr/bin/cut /usr/bin/head /usr/bin/sort
     /usr/bin/date /usr/bin/sleep /usr/bin/id /usr/bin/logname /usr/bin/chmod
     /usr/bin/realpath /usr/bin/env
 )
+if [ "$CAPTIVE_PORTAL_ENABLED" = "1" ]; then
+    required_paths+=(
+        /usr/bin/loginctl /usr/bin/iw /usr/bin/runuser /usr/bin/resolvectl
+        /usr/bin/sysctl /usr/bin/setsid
+    )
+fi
 for path in "${required_paths[@]}"; do
     [ -x "$path" ] || { echo "Missing required executable: $path" >&2; exit 1; }
 done
-browser_found=0
-for browser in /usr/bin/chromium /usr/bin/brave /usr/bin/google-chrome-stable; do
-    [ -x "$browser" ] && browser_found=1
-done
-[ "$browser_found" = "1" ] || {
-    echo "Missing a supported browser under /usr/bin (chromium, brave, or google-chrome-stable)" >&2
-    exit 1
-}
+if [ "$CAPTIVE_PORTAL_ENABLED" = "1" ]; then
+    browser_found=0
+    for browser in /usr/bin/chromium /usr/bin/brave /usr/bin/google-chrome-stable; do
+        [ -x "$browser" ] && browser_found=1
+    done
+    [ "$browser_found" = "1" ] || {
+        echo "Missing a supported browser under /usr/bin (chromium, brave, or google-chrome-stable)" >&2
+        exit 1
+    }
+fi
 
 INSTALL_LOCK_FILE="/run/wireguard-reconnect.install.lock"
 exec 7>"$INSTALL_LOCK_FILE"
@@ -154,7 +209,13 @@ install_project_files() {
     echo "Installing wireguard-reconnect v${PROJECT_VERSION} for ${INTERFACE}..."
     install -Dm644 "$SCRIPT_DIR/VERSION" /usr/local/share/wireguard-reconnect/VERSION
     printf '%s\n' "$INTERFACE" >/usr/local/share/wireguard-reconnect/interface
-    chmod 0644 /usr/local/share/wireguard-reconnect/interface
+    printf '%s\n' "$AUTOMATIC_RECONNECT_ENABLED" >/usr/local/share/wireguard-reconnect/automatic-reconnect-enabled
+    printf '%s\n' "$CAPTIVE_PORTAL_ENABLED" >/usr/local/share/wireguard-reconnect/captive-portal-enabled
+    printf '%s\n' "$KILLSWITCH_ENABLED" >/usr/local/share/wireguard-reconnect/killswitch-enabled
+    chmod 0644 /usr/local/share/wireguard-reconnect/interface \
+        /usr/local/share/wireguard-reconnect/automatic-reconnect-enabled \
+        /usr/local/share/wireguard-reconnect/captive-portal-enabled \
+        /usr/local/share/wireguard-reconnect/killswitch-enabled
     install -Dm755 "$SCRIPT_DIR/wireguard-reconnect" /usr/local/bin/wireguard-reconnect
     install -Dm755 "$SCRIPT_DIR/wireguard-portal" /usr/local/bin/wireguard-portal
     install -Dm755 "$SCRIPT_DIR/wireguard-monitor" /usr/local/bin/wireguard-monitor
@@ -172,12 +233,29 @@ write_root_configuration() {
     printf '%s\n' "$(id -u "$TARGET_USER")" >/etc/wireguard-reconnect/portal-user
     install -m 0600 /dev/null /etc/wireguard-reconnect/interface
     printf '%s\n' "$INTERFACE" >/etc/wireguard-reconnect/interface
-    install -m 0600 /dev/null /etc/wireguard-reconnect/tailscale-enabled
+    local option_file
+    for option_file in killswitch-enabled automatic-reconnect-enabled autostart-enabled \
+        captive-portal-enabled auto-portal-enabled connect-on-install tailscale-enabled; do
+        install -m 0600 /dev/null "/etc/wireguard-reconnect/$option_file"
+    done
+    printf '%s\n' "$KILLSWITCH_ENABLED" >/etc/wireguard-reconnect/killswitch-enabled
+    printf '%s\n' "$AUTOMATIC_RECONNECT_ENABLED" >/etc/wireguard-reconnect/automatic-reconnect-enabled
+    printf '%s\n' "$AUTOSTART_ENABLED" >/etc/wireguard-reconnect/autostart-enabled
+    printf '%s\n' "$CAPTIVE_PORTAL_ENABLED" >/etc/wireguard-reconnect/captive-portal-enabled
+    printf '%s\n' "$AUTO_PORTAL_ENABLED" >/etc/wireguard-reconnect/auto-portal-enabled
+    printf '%s\n' "$CONNECT_ON_INSTALL_ENABLED" >/etc/wireguard-reconnect/connect-on-install
     printf '%s\n' "$TAILSCALE_ENABLED" >/etc/wireguard-reconnect/tailscale-enabled
     install -m 0600 /dev/null /etc/wireguard-reconnect/environment
-    printf 'WIREGUARD_INTERFACE=%s\nWIREGUARD_TAILSCALE_ENABLED=%s\n' \
-        "$INTERFACE" "$TAILSCALE_ENABLED" >/etc/wireguard-reconnect/environment
+    printf 'WIREGUARD_INTERFACE=%s\nWIREGUARD_TAILSCALE_ENABLED=%s\nWIREGUARD_KILLSWITCH=%s\nWIREGUARD_AUTO_PORTAL=%s\nWIREGUARD_AUTOSTART_RETRY=%s\n' \
+        "$INTERFACE" "$TAILSCALE_ENABLED" "$KILLSWITCH_ENABLED" "$AUTO_PORTAL_ENABLED" \
+        "$AUTOSTART_RETRY" >/etc/wireguard-reconnect/environment
     rm -f /etc/wireguard-reconnect/tailscale-operator
+    if [ "$AUTO_PORTAL_ENABLED" != "1" ]; then
+        rm -f /run/wireguard-portal.autodetect
+    fi
+    if [ "$CAPTIVE_PORTAL_ENABLED" != "1" ]; then
+        rm -f /run/wg-killswitch.portal-candidate
+    fi
     if [ "$TAILSCALE_ENABLED" != "1" ]; then
         cleanup_managed_tailscale_rules
     fi
@@ -217,6 +295,7 @@ harden_runtime_state() {
 }
 
 prearm_guard() {
+    [ "$KILLSWITCH_ENABLED" = "1" ] || return 0
     echo "Pre-arming the fail-closed kill switch with a 90-second rollback..."
     if [ "$guard_was_active" = "1" ]; then
         WG_KILLSWITCH_ROLLBACK_ACTION=rearm \
@@ -228,12 +307,44 @@ prearm_guard() {
     /usr/local/bin/wg-killswitch status >/dev/null
 }
 
+disable_selected_unit() {
+    local unit="$1"
+    systemctl disable --now "$unit"
+    ! systemctl is-enabled --quiet "$unit" 2>/dev/null || {
+        echo "Could not disable selected opt-out unit: $unit" >&2
+        return 1
+    }
+    ! systemctl is-active --quiet "$unit" 2>/dev/null || {
+        echo "Could not stop selected opt-out unit: $unit" >&2
+        return 1
+    }
+}
+
+defer_selected_unit() {
+    local unit="$1"
+    systemctl stop "$unit"
+    ! systemctl is-active --quiet "$unit" 2>/dev/null || {
+        echo "Could not defer selected unit until next boot: $unit" >&2
+        return 1
+    }
+}
+
+disable_guard_for_opt_out() {
+    [ "$KILLSWITCH_ENABLED" = "0" ] || return 0
+    disable_selected_unit wireguard-killswitch.service
+    if /usr/bin/nft list tables 2>/dev/null | /usr/bin/grep -Fxq 'table inet wg_killswitch'; then
+        /usr/local/bin/wg-killswitch disable
+    fi
+}
+
 transition_managed_interface() {
     if [ "$prior_iface_was_present" = "1" ] && [ -n "$prior_installed_interface" ] && \
         [ "$prior_installed_interface" != "$INTERFACE" ]; then
         /usr/bin/wg-quick down "$prior_installed_interface"
-        /usr/local/bin/wg-killswitch enable "$INTERFACE"
-        /usr/local/bin/wg-killswitch status >/dev/null
+        if [ "$KILLSWITCH_ENABLED" = "1" ]; then
+            /usr/local/bin/wg-killswitch enable "$INTERFACE"
+            /usr/local/bin/wg-killswitch status >/dev/null
+        fi
     fi
 }
 
@@ -271,25 +382,46 @@ release_transaction_locks() {
     install_lock_held=0
 }
 
-start_automatic_services() {
-    local unit
-    systemctl enable wireguard-monitor.service
-    systemctl restart wireguard-monitor.service
-    systemctl enable wireguard-autostart.service
-    systemctl restart wireguard-autostart.service
-    for unit in wireguard-killswitch.service wireguard-monitor.service wireguard-autostart.service; do
-        require_service_active "$unit" "Required service stopped before commit"
-    done
+start_selected_services() {
+    if [ "$AUTOMATIC_RECONNECT_ENABLED" = "1" ]; then
+        systemctl enable wireguard-monitor.service
+        if [ "$CONNECT_ON_INSTALL_ENABLED" = "1" ]; then
+            systemctl restart wireguard-monitor.service
+            require_service_active wireguard-monitor.service "Required service stopped before commit"
+        else
+            defer_selected_unit wireguard-monitor.service
+        fi
+    else
+        disable_selected_unit wireguard-monitor.service
+    fi
+
+    if [ "$AUTOSTART_ENABLED" = "1" ]; then
+        systemctl enable wireguard-autostart.service
+        if [ "$CONNECT_ON_INSTALL_ENABLED" = "1" ]; then
+            systemctl restart wireguard-autostart.service
+            require_service_active wireguard-autostart.service "Required service stopped before commit"
+        else
+            defer_selected_unit wireguard-autostart.service
+        fi
+    else
+        disable_selected_unit wireguard-autostart.service
+    fi
 }
 
 print_install_summary() {
     echo
     echo "Installed wireguard-reconnect v${PROJECT_VERSION} successfully."
     echo "Interface: $INTERFACE"
+    echo "Kill switch: $([ "$KILLSWITCH_ENABLED" = "1" ] && echo enabled || echo disabled)"
+    echo "Automatic reconnect: $([ "$AUTOMATIC_RECONNECT_ENABLED" = "1" ] && echo enabled || echo disabled)"
+    echo "Connect at boot: $([ "$AUTOSTART_ENABLED" = "1" ] && echo enabled || echo disabled)"
+    echo "Captive portal: $([ "$CAPTIVE_PORTAL_ENABLED" = "1" ] && echo enabled || echo disabled)"
+    echo "Automatic portal detection: $([ "$AUTO_PORTAL_ENABLED" = "1" ] && echo enabled || echo disabled)"
+    echo "Connected during install: $([ "$CONNECT_ON_INSTALL_ENABLED" = "1" ] && echo yes || echo no)"
     echo "Tailscale route integration: $([ "$TAILSCALE_ENABLED" = "1" ] && echo enabled || echo disabled)"
     echo "Backup of replaced files: $BACKUP_DIR"
     echo
-    systemctl status wireguard-killswitch.service wireguard-monitor.service wireguard-autostart.service --no-pager
+    systemctl status wireguard-killswitch.service wireguard-monitor.service wireguard-autostart.service --no-pager || true
 
     echo
     echo "Checking PersistentKeepalive in $INTERFACE config..."
@@ -308,6 +440,9 @@ managed_paths=(
     /usr/local/bin/wg-killswitch
     /usr/local/share/wireguard-reconnect/VERSION
     /usr/local/share/wireguard-reconnect/interface
+    /usr/local/share/wireguard-reconnect/automatic-reconnect-enabled
+    /usr/local/share/wireguard-reconnect/captive-portal-enabled
+    /usr/local/share/wireguard-reconnect/killswitch-enabled
     /usr/lib/systemd/system-sleep/wireguard-reconnect
     /etc/systemd/system/wireguard-monitor.service
     /etc/systemd/system/wireguard-autostart.service
@@ -316,9 +451,19 @@ managed_paths=(
     /etc/wireguard-reconnect/portal-user
     /etc/wireguard-reconnect/interface
     /etc/wireguard-reconnect/environment
+    /etc/wireguard-reconnect/killswitch-enabled
+    /etc/wireguard-reconnect/automatic-reconnect-enabled
+    /etc/wireguard-reconnect/autostart-enabled
+    /etc/wireguard-reconnect/captive-portal-enabled
+    /etc/wireguard-reconnect/auto-portal-enabled
+    /etc/wireguard-reconnect/connect-on-install
     /etc/wireguard-reconnect/tailscale-enabled
     /etc/wireguard-reconnect/tailscale-operator
+    /run/wireguard-reconnect.enabled
+    /run/wireguard-reconnect.autostart-suppressed
     /run/wireguard-reconnect.tailscale-rules
+    /run/wireguard-portal.autodetect
+    /run/wg-killswitch.portal-candidate
     "$TARGET_HOME/.local/bin/wireguard-status"
 )
 for path in "${managed_paths[@]}"; do backup_if_present "$path"; done
@@ -371,6 +516,11 @@ systemctl is-enabled --quiet wireguard-monitor.service 2>/dev/null && monitor_wa
 systemctl is-active --quiet wireguard-monitor.service 2>/dev/null && monitor_was_active=1
 systemctl is-enabled --quiet wireguard-autostart.service 2>/dev/null && autostart_was_enabled=1
 systemctl is-enabled --quiet wireguard-killswitch.service 2>/dev/null && killswitch_was_enabled=1
+if [ "$CONNECT_ON_INSTALL_ENABLED" = "0" ] && [ "$prior_iface_was_present" = "1" ] && \
+   [ -n "$prior_installed_interface" ] && [ "$prior_installed_interface" != "$INTERFACE" ]; then
+    echo "CONNECT_ON_INSTALL=0 cannot migrate an active managed interface; disconnect it first or allow the protected transition." >&2
+    exit 1
+fi
 install_committed=0
 rollback_install() {
     local rc=$?
@@ -471,40 +621,56 @@ harden_runtime_state
 
 systemctl daemon-reload
 prearm_guard
-# A configured interface migration is protected by the new guard and is reversed
-# by rollback when the prior interface was active.
+disable_guard_for_opt_out
+# A configured interface migration is protected by the new guard when enabled
+# and is reversed by rollback when the prior interface was active.
 transition_managed_interface
 
-systemctl reenable wireguard-killswitch.service
-systemctl start wireguard-killswitch.service
+if [ "$KILLSWITCH_ENABLED" = "1" ]; then
+    systemctl reenable wireguard-killswitch.service
+    systemctl start wireguard-killswitch.service
+    require_service_active wireguard-killswitch.service "Required service is not active"
+fi
 
-# Bring up/idempotently validate the selected interface while install, reconnect,
-# and portal locks are still held. Automatic portal work cannot begin while the
-# rollback timer is armed.
-WIREGUARD_INSTALL_LOCK_HELD=1 WIREGUARD_RECONNECT_LOCK_HELD=1 \
-    WIREGUARD_ACTION_LOCKS_HELD=1 \
-    /usr/local/bin/wireguard-reconnect up "$INTERFACE"
+if [ "$CONNECT_ON_INSTALL_ENABLED" = "1" ]; then
+    # Bring up/idempotently validate the selected interface while install,
+    # reconnect, and portal locks are still held.
+    WIREGUARD_INSTALL_LOCK_HELD=1 WIREGUARD_RECONNECT_LOCK_HELD=1 \
+        WIREGUARD_ACTION_LOCKS_HELD=1 \
+        /usr/local/bin/wireguard-reconnect up "$INTERFACE"
+    wait_for_protected_traffic || {
+        echo "WireGuard traffic was not verified after installation." >&2
+        exit 1
+    }
+else
+    # A previous installation or failed link may have left runtime intent. Do
+    # not let Waybar or a manually restarted monitor bypass this transaction's
+    # explicit defer-until-boot choice.
+    rm -f /run/wireguard-reconnect.enabled
+    printf '%s\n' "$INTERFACE" >/run/wireguard-reconnect.autostart-suppressed
+    chmod 0644 /run/wireguard-reconnect.autostart-suppressed
+fi
 
-wait_for_protected_traffic || {
-    echo "WireGuard traffic was not verified after installation." >&2
-    exit 1
-}
-/usr/local/bin/wg-killswitch status >/dev/null
-require_service_active wireguard-killswitch.service "Required service is not active"
-# Confirmation is serialized with the timer. Re-verify every commit invariant
-# afterward so a timer that won the lock first cannot produce a fail-open commit.
-/usr/local/bin/wg-killswitch confirm
-/usr/local/bin/wg-killswitch status >/dev/null
-protected_traffic_ok || {
-    echo "Protected traffic failed after rollback confirmation." >&2
-    exit 1
-}
-require_service_active wireguard-killswitch.service "Kill-switch service stopped before commit"
+if [ "$KILLSWITCH_ENABLED" = "1" ]; then
+    /usr/local/bin/wg-killswitch status >/dev/null
+    # Confirmation is serialized with the timer. Re-verify the selected commit
+    # invariants afterward so a timer that won the lock cannot produce a
+    # fail-open commit.
+    /usr/local/bin/wg-killswitch confirm
+    /usr/local/bin/wg-killswitch status >/dev/null
+    if [ "$CONNECT_ON_INSTALL_ENABLED" = "1" ]; then
+        protected_traffic_ok || {
+            echo "Protected traffic failed after rollback confirmation." >&2
+            exit 1
+        }
+    fi
+    require_service_active wireguard-killswitch.service "Kill-switch service stopped before commit"
+fi
 
-# The timer is gone and guard/traffic were verified after confirmation. Release
-# the exclusive transaction locks, then start long-lived automatic callers.
+# The timer is gone (when used) and selected invariants are verified. Release
+# transaction locks, then start only the explicitly selected automatic callers.
 release_transaction_locks
-start_automatic_services
+start_selected_services
 
 /usr/bin/pkill -RTMIN+10 -u "$TARGET_USER" waybar 2>/dev/null || true
 install_committed=1

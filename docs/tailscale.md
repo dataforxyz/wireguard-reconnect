@@ -22,7 +22,9 @@ There are two distinct behaviors:
    first, it adds a root-owned, tracked destination rule immediately ahead of
    them. Existing policy rules are never deleted or rewritten.
 
-Enable or disable policy-rule repair by re-running the transactional installer:
+Enable or disable policy-rule repair by re-running the transactional installer.
+After the first explicit opt-in, later upgrades retain the recorded value when
+the option is omitted:
 
 ```bash
 sudo ENABLE_TAILSCALE_INTEGRATION=1 ./install.sh
