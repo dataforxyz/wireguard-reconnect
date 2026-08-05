@@ -3,6 +3,24 @@
 All notable public changes are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Changed
+
+- Refactored installer and uninstaller orchestration into named internal phases
+  without introducing a shared privileged shell library.
+- Split detailed installer, Tailscale, captive-portal, and testing guidance into
+  focused operator documents while keeping the README as a concise entry point.
+
+### Tests
+
+- Added disposable user/mount-namespace coverage for fresh install success and
+  rollback, managed interface migration and exact-state rollback, Tailscale
+  opt-out, successful uninstall cleanup, and fail-closed uninstall retention.
+- Added maintenance-contract checks for executable preflight coverage, installed
+  artifact cleanup, sensitive file modes, standalone privileged helpers, README
+  size, and relative documentation links.
+
 ## [1.3.0-beta.1] - 2026-08-05
 
 Initial public beta.

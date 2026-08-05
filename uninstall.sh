@@ -50,6 +50,80 @@ if [ -n "${RESTORE_BACKUP_DIR:-}" ]; then
     }
 fi
 
+release_transaction_locks() {
+    flock -u 8
+    flock -u 5
+    flock -u 7
+}
+
+abort_uninstall() {
+    local message="$1"
+    echo "$message" >&2
+    release_transaction_locks || true
+    if [ "$monitor_was_active" = "1" ]; then systemctl start wireguard-monitor.service 2>/dev/null || true; fi
+    if [ "$autostart_was_active" = "1" ]; then systemctl restart wireguard-autostart.service 2>/dev/null || true; fi
+    exit 1
+}
+
+remove_tracked_tailscale_rules() {
+    local state=/run/wireguard-reconnect.tailscale-rules pref
+    [ -r "$state" ] || return 0
+    pref="$(/usr/bin/awk -F= '$1 == "V4_PREF" {print $2; exit}' "$state" 2>/dev/null || true)"
+    if [[ "$pref" =~ ^[0-9]+$ ]]; then
+        /usr/bin/ip -4 rule del pref "$pref" to 100.64.0.0/10 lookup 52 2>/dev/null || true
+    fi
+    pref="$(/usr/bin/awk -F= '$1 == "V6_PREF" {print $2; exit}' "$state" 2>/dev/null || true)"
+    if [[ "$pref" =~ ^[0-9]+$ ]]; then
+        /usr/bin/ip -6 rule del pref "$pref" to fd7a:115c:a1e0::/48 lookup 52 2>/dev/null || true
+    fi
+    rm -f "$state"
+}
+
+disconnect_and_remove_guard() {
+    if [ -x /usr/local/bin/wireguard-reconnect ]; then
+        WIREGUARD_INSTALL_LOCK_HELD=1 WIREGUARD_RECONNECT_LOCK_HELD=1 \
+            WIREGUARD_ACTION_LOCKS_HELD=1 /usr/local/bin/wireguard-reconnect down "$IFACE" || \
+            abort_uninstall "Could not cleanly disconnect $IFACE and remove the kill switch; uninstall aborted."
+    elif [ -x /usr/local/bin/wg-killswitch ]; then
+        /usr/local/bin/wg-killswitch disable || \
+            abort_uninstall "Could not remove the kill switch; uninstall aborted."
+    elif /usr/bin/grep -Fxq 'table inet wg_killswitch' <<<"$nft_tables"; then
+        abort_uninstall "A WireGuard policy-drop table exists but the recovery helper is missing; refusing destructive cleanup."
+    fi
+}
+
+remove_installed_files() {
+    rm -f \
+        /usr/local/bin/wireguard-reconnect \
+        /usr/local/bin/wireguard-portal \
+        /usr/local/bin/wireguard-monitor \
+        /usr/local/bin/wireguard-autostart \
+        /usr/local/bin/wg-killswitch \
+        /usr/lib/systemd/system-sleep/wireguard-reconnect \
+        /etc/systemd/system/wireguard-monitor.service \
+        /etc/systemd/system/wireguard-autostart.service \
+        /etc/systemd/system/wireguard-killswitch.service \
+        /etc/polkit-1/rules.d/49-wireguard-reconnect.rules
+    rm -rf /usr/local/share/wireguard-reconnect /etc/wireguard-reconnect \
+        /var/lib/wg-killswitch /run/wireguard-reconnect
+}
+
+remove_runtime_state() {
+    rm -f \
+        /run/wireguard-reconnect.enabled /run/wireguard-reconnect.failure /run/wireguard-reconnect.log \
+        /run/wireguard-reconnect.tailscale-rules \
+        /run/wg-killswitch.enabled /run/wg-killswitch.endpoint /run/wg-killswitch.portal-candidate \
+        /run/wg-killswitch.log /run/wg-killswitch.log.lock /run/wg-killswitch.rollback-token \
+        /run/wireguard-portal.active /run/wireguard-portal.autodetect /run/wireguard-portal.log
+}
+
+restore_requested_backup() {
+    [ -n "$VALIDATED_RESTORE_BACKUP" ] || return 0
+    cp -a "$VALIDATED_RESTORE_BACKUP"/. /
+    systemctl daemon-reload
+    echo "Restored explicitly requested backup: $VALIDATED_RESTORE_BACKUP"
+}
+
 # Serialize the entire destructive transaction against both new helpers (the
 # install lock) and pre-public helpers (the action locks). Lock files remain in
 # /run after uninstall so waiters cannot split onto a newly created inode.
@@ -76,65 +150,16 @@ systemctl is-active --quiet wireguard-monitor.service 2>/dev/null && monitor_was
 systemctl is-active --quiet wireguard-autostart.service 2>/dev/null && autostart_was_active=1
 systemctl stop wireguard-monitor.service wireguard-autostart.service 2>/dev/null || true
 
-abort_uninstall() {
-    local message="$1"
-    echo "$message" >&2
-    flock -u 8 || true
-    flock -u 5 || true
-    flock -u 7 || true
-    if [ "$monitor_was_active" = "1" ]; then systemctl start wireguard-monitor.service 2>/dev/null || true; fi
-    if [ "$autostart_was_active" = "1" ]; then systemctl restart wireguard-autostart.service 2>/dev/null || true; fi
-    exit 1
-}
-
 # Intentional down is the supported operation that removes both the interface
 # and fail-closed nftables guard. Do not delete the helpers if that cleanup fails.
-if [ -x /usr/local/bin/wireguard-reconnect ]; then
-    if ! WIREGUARD_INSTALL_LOCK_HELD=1 WIREGUARD_RECONNECT_LOCK_HELD=1 \
-        WIREGUARD_ACTION_LOCKS_HELD=1 /usr/local/bin/wireguard-reconnect down "$IFACE"; then
-        abort_uninstall "Could not cleanly disconnect $IFACE and remove the kill switch; uninstall aborted."
-    fi
-elif [ -x /usr/local/bin/wg-killswitch ]; then
-    /usr/local/bin/wg-killswitch disable || {
-        abort_uninstall "Could not remove the kill switch; uninstall aborted."
-    }
-elif /usr/bin/grep -Fxq 'table inet wg_killswitch' <<<"$nft_tables"; then
-    abort_uninstall "A WireGuard policy-drop table exists but the recovery helper is missing; refusing destructive cleanup."
-fi
-
-if [ -r /run/wireguard-reconnect.tailscale-rules ]; then
-    pref="$(/usr/bin/awk -F= '$1 == "V4_PREF" {print $2; exit}' /run/wireguard-reconnect.tailscale-rules 2>/dev/null || true)"
-    if [[ "$pref" =~ ^[0-9]+$ ]]; then
-        /usr/bin/ip -4 rule del pref "$pref" to 100.64.0.0/10 lookup 52 2>/dev/null || true
-    fi
-    pref="$(/usr/bin/awk -F= '$1 == "V6_PREF" {print $2; exit}' /run/wireguard-reconnect.tailscale-rules 2>/dev/null || true)"
-    if [[ "$pref" =~ ^[0-9]+$ ]]; then
-        /usr/bin/ip -6 rule del pref "$pref" to fd7a:115c:a1e0::/48 lookup 52 2>/dev/null || true
-    fi
-    rm -f /run/wireguard-reconnect.tailscale-rules
-fi
+disconnect_and_remove_guard
+remove_tracked_tailscale_rules
 
 systemctl disable wireguard-monitor.service wireguard-autostart.service 2>/dev/null || true
 systemctl disable --now wireguard-killswitch.service 2>/dev/null || true
 
-rm -f \
-    /usr/local/bin/wireguard-reconnect \
-    /usr/local/bin/wireguard-portal \
-    /usr/local/bin/wireguard-monitor \
-    /usr/local/bin/wireguard-autostart \
-    /usr/local/bin/wg-killswitch \
-    /usr/lib/systemd/system-sleep/wireguard-reconnect \
-    /etc/systemd/system/wireguard-monitor.service \
-    /etc/systemd/system/wireguard-autostart.service \
-    /etc/systemd/system/wireguard-killswitch.service \
-    /etc/polkit-1/rules.d/49-wireguard-reconnect.rules
-rm -rf /usr/local/share/wireguard-reconnect /etc/wireguard-reconnect /var/lib/wg-killswitch /run/wireguard-reconnect
-rm -f \
-    /run/wireguard-reconnect.enabled /run/wireguard-reconnect.failure /run/wireguard-reconnect.log \
-    /run/wireguard-reconnect.tailscale-rules \
-    /run/wg-killswitch.enabled /run/wg-killswitch.endpoint /run/wg-killswitch.portal-candidate \
-    /run/wg-killswitch.log /run/wg-killswitch.log.lock /run/wg-killswitch.rollback-token \
-    /run/wireguard-portal.active /run/wireguard-portal.autodetect /run/wireguard-portal.log
+remove_installed_files
+remove_runtime_state
 
 if [ "$SAFE_USER_STATUS_PATH" = "1" ]; then
     rm -f "$TARGET_HOME/.local/bin/wireguard-status"
@@ -143,15 +168,8 @@ fi
 systemctl daemon-reload
 systemctl reset-failed wireguard-monitor.service wireguard-autostart.service wireguard-killswitch.service 2>/dev/null || true
 
-if [ -n "$VALIDATED_RESTORE_BACKUP" ]; then
-    cp -a "$VALIDATED_RESTORE_BACKUP"/. /
-    systemctl daemon-reload
-    echo "Restored explicitly requested backup: $VALIDATED_RESTORE_BACKUP"
-fi
-
-flock -u 8
-flock -u 5
-flock -u 7
+restore_requested_backup
+release_transaction_locks
 
 echo "wireguard-reconnect removed."
 echo "WireGuard configs under /etc/wireguard and unrequested installer backups were not modified."

@@ -147,6 +147,8 @@ test:
 	@./tests/test-portal-probes.sh
 	@./tests/test-portal-session.sh
 	@./tests/test-auto-portal.sh
+	@./tests/test-maintenance.sh
+	@./tests/test-installer-netns.sh
 	@./tests/test-public-release.sh
 	@./tests/test-version.sh
 

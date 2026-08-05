@@ -87,7 +87,7 @@ grep -Fq 'wireguard-reconnect down "$IFACE"' "$REPO_DIR/uninstall.sh"
 grep -Fq 'Captive-portal mode is active or cleanup is incomplete' "$REPO_DIR/uninstall.sh"
 
 helper_down_line="$(grep -n 'wireguard-reconnect down' "$REPO_DIR/uninstall.sh" | head -n1 | cut -d: -f1)"
-helper_remove_line="$(grep -n '^    /usr/local/bin/wireguard-reconnect' "$REPO_DIR/uninstall.sh" | head -n1 | cut -d: -f1)"
+helper_remove_line="$(grep -nE '^[[:space:]]+/usr/local/bin/wireguard-reconnect \\$' "$REPO_DIR/uninstall.sh" | head -n1 | cut -d: -f1)"
 [ "$helper_down_line" -lt "$helper_remove_line" ]
 
 printf 'public release hygiene tests: OK\n'

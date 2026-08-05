@@ -11,14 +11,14 @@ permissions:
 
 jobs:
   shell-tests:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
       - name: Install test dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y shellcheck nftables iproute2 wireguard-tools curl python3 util-linux
+          sudo apt-get install -y shellcheck nftables iproute2 wireguard-tools iw curl python3 util-linux uidmap
       - name: Bash syntax
         run: |
           bash -n install.sh uninstall.sh wg-killswitch wireguard-autostart \
@@ -31,12 +31,18 @@ jobs:
             wireguard-reconnect-sleep wireguard-status tests/*.sh
       - name: Regression suite
         run: make test
-      - name: Require kernel namespace/nftables isolation test
+      - name: Require kernel namespace integration tests
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+          if ! grep -q "^$(id -un):" /etc/subuid; then
+            sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$(id -un)"
+          fi
           output="$(./tests/test-portal-netns.sh)"
           printf '%s\n' "$output"
           grep -Fq 'portal namespace kernel isolation test: OK' <<<"$output"
+          output="$(./tests/test-installer-netns.sh)"
+          printf '%s\n' "$output"
+          grep -Fq 'installer namespace transaction test: OK' <<<"$output"
       - name: Verify systemd units
         run: |
           sudo install -Dm755 ./wg-killswitch /usr/local/bin/wg-killswitch

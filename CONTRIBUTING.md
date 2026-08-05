@@ -25,12 +25,37 @@ shellcheck install.sh uninstall.sh wg-killswitch wireguard-autostart \
 git diff --check
 ```
 
+For installer, uninstall, or interface-migration changes, run the disposable
+transaction test explicitly and confirm it reports `OK` rather than `SKIP`:
+
+```bash
+./tests/test-installer-netns.sh
+```
+
 For portal changes, also run:
 
 ```bash
 make portal-simulate
 make portal-container-simulate
 ```
+
+Operator documentation is organized under [`docs/`](docs/README.md). Keep the
+root README focused on support, quick start, controls, and security boundaries.
+Detailed transaction, Tailscale, portal, and test material belongs in the
+corresponding operator document.
+
+## Maintainability boundaries
+
+- Keep privileged executables standalone; do not source a separately writable or
+  separately versioned shell library from root helpers.
+- Prefer small internal phase functions over copy/pasted orchestration blocks.
+- Any new absolute executable path must be covered by installer preflight.
+- Installed privileged artifacts must have a matching uninstall contract.
+- Preserve root-only modes for endpoint, portal, rollback, and privileged log
+  state.
+
+`tests/test-maintenance.sh` enforces these cross-file contracts and validates
+relative Markdown links.
 
 ## Review expectations
 
