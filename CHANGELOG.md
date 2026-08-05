@@ -3,6 +3,15 @@
 All notable changes to this project are documented here. The project follows
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.3] - 2026-08-05
+
+### Security
+
+- Kept isolated portal endpoint candidates out of the generic runtime endpoint
+  state. Post-portal bootstrap now reads the portal candidate explicitly, while
+  a failed/discarded portal transaction leaves the previous ordinary reconnect
+  state unchanged and cannot influence later automatic retries.
+
 ## [1.2.2] - 2026-08-05
 
 ### Added
@@ -135,6 +144,7 @@ All notable changes to this project are documented here. The project follows
 - Critical failures are recorded in `/run/wireguard-reconnect.failure` and
   surfaced in the Waybar tooltip.
 
+[1.2.3]: https://github.com/dataforxyz/wireguard-reconnect/releases/tag/v1.2.3
 [1.2.2]: https://github.com/dataforxyz/wireguard-reconnect/releases/tag/v1.2.2
 [1.2.1]: https://github.com/dataforxyz/wireguard-reconnect/releases/tag/v1.2.1
 [1.2.0]: https://github.com/dataforxyz/wireguard-reconnect/releases/tag/v1.2.0
