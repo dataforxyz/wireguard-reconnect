@@ -244,10 +244,16 @@ guard_watchdog() {
         )
 
         # A Wi-Fi portal may already be present before the desktop Wayland
-        # session exists. Re-evaluate periodically so login triggers automatic
-        # isolated detection without requiring another route/AP event.
+        # session exists. Run the normal repair path periodically so wake and
+        # roaming always get a protected reconnect attempt before portal mode
+        # is considered; portal detection is only the fallback after that
+        # reconnect remains offline.
         if [ ! -f "$PORTAL_STATE" ] && vpn_intended_on && underlay_online && ! vpn_online; then
-            maybe_auto_portal "periodic Wi-Fi health check" || true
+            # Keep repair/portal orchestration outside the sole watchdog loop.
+            # ACTION_LOCK makes repeated checks cheap no-ops while a long portal
+            # login is active, while this parent continues verifying nftables
+            # protection every GUARD_CHECK_INTERVAL seconds.
+            repair_if_needed "periodic Wi-Fi health check" &
         fi
     done
 }

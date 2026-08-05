@@ -25,6 +25,8 @@ KILLSWITCH_STATE="/run/wg-killswitch.enabled"
 KILLSWITCH_ENDPOINT_STATE="/run/wg-killswitch.endpoint"
 BOOTSTRAP_DIR="/run/wireguard-reconnect"
 TAILSCALE_OPERATOR="${TAILSCALE_OPERATOR:-dxyz}"
+CHECK_URL="${WIREGUARD_CHECK_URL:-http://connectivitycheck.gstatic.com/generate_204}"
+CHECK_TIMEOUT="${WIREGUARD_CHECK_TIMEOUT:-4}"
 
 ACTION="${1:-}"
 IFACE="${2:-wg0}"
@@ -198,6 +200,15 @@ wg_quick_up() {
     /usr/bin/wg-quick up "$conf"
 }
 
+vpn_traffic_verified() {
+    local code
+    ip link show "$IFACE" >/dev/null 2>&1 || return 1
+    ip -4 route get 9.9.9.9 2>/dev/null | grep -q " dev ${IFACE}\\b" || return 1
+    code="$(curl --interface "$IFACE" --silent --show-error --max-time "$CHECK_TIMEOUT" \
+        --output /dev/null --write-out '%{http_code}' "$CHECK_URL" 2>/dev/null || true)"
+    [ "$code" = "204" ] || [ "$code" = "200" ]
+}
+
 arm_and_verify_kill_switch() {
     [ "$KILLSWITCH_ENABLED" = "1" ] || return 0
     if [ ! -x "$KILLSWITCH_HELPER" ]; then
@@ -364,8 +375,18 @@ fi
 # If this verification fails, take wg0 back down while leaving the pre-armed
 # guard in place. That is fail-closed: no verified guard means no VPN traffic.
 if [ "$ACTION" != "down" ] && [ "$KILLSWITCH_ENABLED" = "1" ]; then
+    endpoint_verified=0
+    if vpn_traffic_verified; then
+        endpoint_verified=1
+        echo "[#] WireGuard traffic verified; endpoint cache may be promoted" >>"$LOG_FILE"
+    else
+        echo "[#] WireGuard traffic is not yet verified; endpoint cache remains unchanged" >>"$LOG_FILE"
+    fi
+
     echo "[#] refreshing and verifying wg-killswitch for $IFACE" >>"$LOG_FILE"
-    if ! /usr/bin/timeout 15s "$KILLSWITCH_HELPER" enable "$IFACE" >>"$LOG_FILE" 2>&1 || ! kill_switch_active; then
+    if ! WIREGUARD_ENDPOINT_VERIFIED="$endpoint_verified" \
+        /usr/bin/timeout 15s "$KILLSWITCH_HELPER" enable "$IFACE" >>"$LOG_FILE" 2>&1 || \
+       ! kill_switch_active; then
         /usr/bin/wg-quick down "$IFACE" >>"$LOG_FILE" 2>&1 || true
         critical "post-connect kill-switch verification failed; $IFACE was taken down and public traffic remains blocked"
         exit 1
