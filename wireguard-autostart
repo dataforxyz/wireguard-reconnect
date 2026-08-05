@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Mark WireGuard as intended-on on every boot and connect it as soon as the
 # physical network has a default route. The network monitor handles a late Wi-Fi
 # connection if no underlay is ready when this unit first runs.

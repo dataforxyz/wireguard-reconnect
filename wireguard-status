@@ -1,11 +1,17 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # WireGuard status script for Waybar
 #
 # The icon is green only when traffic actually works through WireGuard.  An
 # interface that exists but cannot pass a connectivity check is shown as stale,
 # which is what happens after some sleep/wake and captive-portal transitions.
 
-INTERFACE="${WIREGUARD_INTERFACE:-wg0}"
+INTERFACE="${WIREGUARD_INTERFACE:-}"
+PUBLIC_INTERFACE_FILE="${WIREGUARD_PUBLIC_INTERFACE_FILE:-/usr/local/share/wireguard-reconnect/interface}"
+if [ -z "$INTERFACE" ] && [ -r "$PUBLIC_INTERFACE_FILE" ]; then
+    INTERFACE="$(head -n1 "$PUBLIC_INTERFACE_FILE" 2>/dev/null || true)"
+fi
+[ -n "$INTERFACE" ] || INTERFACE=wg0
 WAYBAR_SIGNAL="${WAYBAR_WIREGUARD_SIGNAL:-RTMIN+10}"
 # The privileged helper (run as root via pkexec) owns and writes this file; we
 # only read it for tooltips/error messages.

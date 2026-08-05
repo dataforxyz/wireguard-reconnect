@@ -1,0 +1,33 @@
+name: Bug report
+description: Report a non-sensitive defect or compatibility problem
+title: "[bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Do not include WireGuard configs, keys, credentials, or security vulnerabilities. Use the Security tab for private vulnerability reports.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: wireguard-reconnect 1.3.0
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Distribution, kernel, network manager, nftables, WireGuard, systemd, desktop session, and browser.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and observed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs
+      description: Relevant redacted output from make logs. Remove addresses, domains, usernames, and credentials.

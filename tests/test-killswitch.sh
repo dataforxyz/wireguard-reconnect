@@ -18,10 +18,16 @@ case "${1:-}" in
     : >"$NFT_ACTIVE"
     ;;
   list)
+    [ "${NFT_FAIL_QUERY:-0}" != "1" ] || exit 1
+    if [ "${2:-}" = "tables" ]; then
+      [ ! -f "$NFT_ACTIVE" ] || echo 'table inet wg_killswitch'
+      exit 0
+    fi
     [ -f "$NFT_ACTIVE" ] || exit 1
     cat "$NFT_CAPTURE"
     ;;
   delete)
+    [ "${NFT_FAIL_DELETE:-0}" != "1" ] || exit 1
     rm -f "$NFT_ACTIVE" "$NFT_CAPTURE"
     ;;
   *)
@@ -66,6 +72,8 @@ export NFT_ACTIVE="$TMP/run/nft.active"
 export WG_CONFIG_DIR="$TMP/config"
 export WG_KILLSWITCH_STATE_FILE="$TMP/run/enabled"
 export WG_KILLSWITCH_ROLLBACK_TOKEN_FILE="$TMP/run/rollback"
+export WG_KILLSWITCH_ROLLBACK_LOCK_FILE="$TMP/run/rollback.lock"
+export WG_KILLSWITCH_SELF_PATH="$REPO_DIR/wg-killswitch"
 export WG_KILLSWITCH_ENDPOINT_STATE_FILE="$TMP/run/endpoint"
 export WG_KILLSWITCH_PERSISTENT_STATE_DIR="$TMP/state"
 export WG_KILLSWITCH_PORTAL_CANDIDATE_STATE_FILE="$TMP/run/portal-candidate"
@@ -83,6 +91,7 @@ EOF
 "$REPO_DIR/wg-killswitch" enable wg0
 "$REPO_DIR/wg-killswitch" status >/dev/null
 "$REPO_DIR/wg-killswitch" status-portal >/dev/null
+[ "$(stat -c '%a' "$WG_KILLSWITCH_ENDPOINT_STATE_FILE")" = "600" ]
 
 grep -q 'hook output.*policy drop' "$NFT_CAPTURE"
 grep -q 'hook forward.*policy drop' "$NFT_CAPTURE"
@@ -110,6 +119,24 @@ test ! -e "$TMP/state/endpoint"
 if command -v unshare >/dev/null 2>&1 && unshare -Urn true 2>/dev/null; then
   unshare -Urn /usr/bin/nft -c -f "$NFT_CAPTURE"
 fi
+
+# Confirmation is atomic with the rollback watcher: a confirmed short timer
+# must never disable the already-verified table later.
+WG_KILLSWITCH_ROLLBACK_SECONDS=1 "$REPO_DIR/wg-killswitch" enable-rollback wg0
+"$REPO_DIR/wg-killswitch" confirm
+sleep 2
+"$REPO_DIR/wg-killswitch" status >/dev/null
+
+# Upgrade-time expiry re-arms the prior protected interface instead of ever
+# disabling a pre-existing guard.
+cp "$TMP/config/wg0.conf" "$TMP/config/wg1.conf"
+WG_KILLSWITCH_ROLLBACK_SECONDS=1 WG_KILLSWITCH_ROLLBACK_ACTION=rearm \
+  WG_KILLSWITCH_ROLLBACK_INTERFACE=wg1 \
+  "$REPO_DIR/wg-killswitch" enable-rollback wg0
+sleep 2
+[ "$(cat "$WG_KILLSWITCH_STATE_FILE")" = "wg1" ]
+"$REPO_DIR/wg-killswitch" status >/dev/null
+"$REPO_DIR/wg-killswitch" enable wg0
 
 # A second, explicitly traffic-verified refresh is the only operation allowed
 # to promote the runtime endpoint into the persistent cache.
@@ -215,6 +242,28 @@ test -e "$NFT_ACTIVE"
 grep -q 'hook output.*policy drop' "$NFT_CAPTURE"
 grep -q 'emergency block public non-WireGuard egress' "$NFT_CAPTURE"
 "$REPO_DIR/wg-killswitch" status-portal >/dev/null
+
+# A failed nft deletion must be reported and retain enough state/helper context
+# for a later recovery attempt instead of claiming success.
+export NFT_FAIL_DELETE=1
+if "$REPO_DIR/wg-killswitch" disable; then
+  echo "expected nft delete failure to propagate" >&2
+  exit 1
+fi
+test -e "$NFT_ACTIVE"
+test -e "$WG_KILLSWITCH_STATE_FILE"
+unset NFT_FAIL_DELETE
+export NFT_FAIL_QUERY=1
+if "$REPO_DIR/wg-killswitch" disable; then
+  echo "expected nft query failure to propagate" >&2
+  exit 1
+fi
+test -e "$NFT_ACTIVE"
+test -e "$WG_KILLSWITCH_STATE_FILE"
+unset NFT_FAIL_QUERY
+"$REPO_DIR/wg-killswitch" disable
+test ! -e "$NFT_ACTIVE"
+test ! -e "$WG_KILLSWITCH_STATE_FILE"
 
 # The only append-style runtime log is bounded during long uptimes. Journald
 # handles its own rotation; reconnect and portal transaction logs are truncated

@@ -47,6 +47,11 @@ export XDG_RUNTIME_DIR="$TMP/run"
 
 grep -Fxq "$TMP/bin/helper down wg0" "$STATUS_CALL_LOG"
 
+printf 'wg1\n' >"$TMP/run/interface"
+: >"$STATUS_CALL_LOG"
+WIREGUARD_PUBLIC_INTERFACE_FILE="$TMP/run/interface" "$REPO_DIR/wireguard-status" disconnect
+grep -Fxq "$TMP/bin/helper down wg1" "$STATUS_CALL_LOG"
+
 touch "$WIREGUARD_PORTAL_STATE"
 portal_status="$("$REPO_DIR/wireguard-status")"
 grep -Fq '"class": "portal"' <<<"$portal_status"

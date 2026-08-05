@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Tiny local captive portal used by the no-root integration simulation."""
 
 import argparse

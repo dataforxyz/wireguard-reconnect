@@ -1,6 +1,6 @@
 SHELL := /bin/bash
 
-INTERFACE ?= wg0
+INTERFACE ?= $(shell head -n1 /usr/local/share/wireguard-reconnect/interface 2>/dev/null || printf '%s' wg0)
 STATUS_SCRIPT ?= ./wireguard-status
 PRIVILEGED_HELPER ?= /usr/local/bin/wireguard-reconnect
 PKEXEC ?= pkexec
@@ -12,7 +12,7 @@ PORTAL_CONTAINER_SIMULATOR ?= ./tests/simulate-captive-portal-container.sh
 INTENT_STATE ?= /run/wireguard-reconnect.enabled
 KILLSWITCH_STATE ?= /run/wg-killswitch.enabled
 
-.PHONY: help status toggle connect disconnect reconnect reset portal portal-simulate portal-container-simulate logs diagnostics test install
+.PHONY: help status toggle connect disconnect reconnect reset portal portal-simulate portal-container-simulate logs diagnostics support-info test install uninstall
 
 help:
 	@printf '%s\n' \
@@ -32,9 +32,11 @@ help:
 	  '' \
 	  'Troubleshooting:' \
 	  '  make logs         Show recent service and helper logs' \
-	  '  make diagnostics  Show interfaces, routes, rules, and VPN state' \
+	  '  make diagnostics  Show raw interfaces/routes; redact before sharing' \
+	  '  make support-info Show a reduced, shareable support summary' \
 	  '  make test         Run the repository regression tests' \
-	  '  make install      Install/update the system integration (uses sudo)'
+	  '  make install      Install/update the system integration (uses sudo)' \
+	  '  make uninstall    Remove the integration safely (uses sudo)'
 
 status:
 	@$(STATUS_SCRIPT)
@@ -79,6 +81,7 @@ reset:
 	exit "$${rc:-1}"
 
 logs:
+	@printf '%s\n' 'WARNING: raw logs may contain network addresses, interface names, and local paths. Redact before sharing.'
 	@journalctl \
 	  -u wireguard-killswitch.service \
 	  -u wireguard-monitor.service \
@@ -91,15 +94,16 @@ logs:
 	@printf '\n-- monitor process --\n'
 	@systemctl show wireguard-monitor.service -p ActiveState -p SubState -p ActiveEnterTimestamp -p MainPID || true
 	@printf '\n-- /run/wg-killswitch.log --\n'
-	@tail -n 100 /run/wg-killswitch.log 2>/dev/null || true
+	@tail -n 100 /run/wg-killswitch.log 2>/dev/null || echo '(root-only; use sudo make logs for helper detail)'
 	@printf '\n-- /run/wireguard-reconnect.log --\n'
-	@tail -n 50 /run/wireguard-reconnect.log 2>/dev/null || true
+	@tail -n 50 /run/wireguard-reconnect.log 2>/dev/null || echo '(root-only; use sudo make logs for helper detail)'
 	@printf '\n-- /run/wireguard-reconnect.failure --\n'
 	@cat /run/wireguard-reconnect.failure 2>/dev/null || true
 	@printf '\n-- /run/wireguard-portal.log --\n'
-	@tail -n 100 /run/wireguard-portal.log 2>/dev/null || true
+	@tail -n 100 /run/wireguard-portal.log 2>/dev/null || echo '(root-only; use sudo make logs for helper detail)'
 
 diagnostics:
+	@printf '%s\n' 'WARNING: diagnostics contain addresses, routes, interfaces, and local metadata. Redact before sharing.'
 	@printf '%s\n' '-- status --'
 	@$(STATUS_SCRIPT)
 	@printf '%s\n' '-- WireGuard --'
@@ -117,7 +121,22 @@ diagnostics:
 	@printf '%s\n' '-- leak-protection guard --'
 	@[[ -e /run/wg-killswitch.enabled ]] && cat /run/wg-killswitch.enabled || echo off
 	@printf '%s\n' '-- captive portal transaction --'
-	@[[ -e /run/wireguard-portal.active ]] && cat /run/wireguard-portal.active || echo inactive
+	@[[ -e /run/wireguard-portal.active ]] && echo active || echo inactive
+
+support-info:
+	@printf '%s\n' '-- version --'
+	@WIREGUARD_RECONNECT_VERSION_FILE=./VERSION ./wireguard-reconnect --version
+	@printf '%s\n' '-- platform --'
+	@printf 'kernel=%s\n' "$$(uname -r)"
+	@awk -F= '/^(ID|VERSION_ID)=/ {print}' /etc/os-release 2>/dev/null || true
+	@printf '%s\n' '-- service state --'
+	@for unit in wireguard-killswitch wireguard-monitor wireguard-autostart; do \
+	  printf '%s active=%s enabled=%s\n' "$$unit" \
+	    "$$(systemctl is-active "$$unit.service" 2>/dev/null || true)" \
+	    "$$(systemctl is-enabled "$$unit.service" 2>/dev/null || true)"; \
+	done
+	@printf '%s\n' '-- VPN summary --'
+	@$(STATUS_SCRIPT)
 
 test:
 	@./tests/test-killswitch.sh
@@ -128,7 +147,11 @@ test:
 	@./tests/test-portal-probes.sh
 	@./tests/test-portal-session.sh
 	@./tests/test-auto-portal.sh
+	@./tests/test-public-release.sh
 	@./tests/test-version.sh
 
 install:
 	sudo ./install.sh
+
+uninstall:
+	sudo ./uninstall.sh

@@ -5,9 +5,13 @@ Wants=network.target wireguard-killswitch.service
 
 [Service]
 Type=simple
+EnvironmentFile=/etc/wireguard-reconnect/environment
 ExecStart=/usr/local/bin/wireguard-monitor
 Restart=always
 RestartSec=3
+# Bash exits 128+SIGTERM when systemd intentionally replaces the ip-monitor
+# pipeline during install and resume. Treat that controlled shutdown as clean.
+SuccessExitStatus=143
 
 [Install]
 WantedBy=multi-user.target

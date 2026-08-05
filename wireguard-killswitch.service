@@ -4,12 +4,12 @@ DefaultDependencies=no
 After=local-fs.target
 Before=network-pre.target shutdown.target
 Conflicts=shutdown.target
-ConditionPathExists=/etc/wireguard/wg0.conf
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/wg-killswitch enable wg0
+EnvironmentFile=/etc/wireguard-reconnect/environment
+ExecStart=/usr/local/bin/wg-killswitch enable ${WIREGUARD_INTERFACE}
 RemainAfterExit=yes
 
 [Install]
-WantedBy=network-pre.target
+RequiredBy=network-pre.target

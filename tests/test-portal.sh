@@ -90,6 +90,38 @@ if command -v unshare >/dev/null 2>&1 && unshare -Urnm true 2>/dev/null; then
     set -e
     [ "$rc" -eq 1 ]
     grep -Fq "Captive-portal mode is active; refusing down" /run/wireguard-reconnect.log
+    [ "$(stat -c "%a" /run/wireguard-reconnect.log)" = "600" ]
+  ' bash "$REPO_DIR/wireguard-reconnect"
+
+  # Passwordless polkit access is pinned to the one root-configured interface;
+  # another wgN name is rejected before any config or hook can be evaluated.
+  # shellcheck disable=SC2016 # Inner script intentionally expands in the child shell.
+  unshare -Urnm bash -c '
+    set -e
+    mount -t tmpfs tmpfs /run
+    set +e
+    WIREGUARD_AUTHORIZED_INTERFACE=wg0 "$1" down wg1 >/dev/null 2>&1
+    rc=$?
+    set -e
+    [ "$rc" -eq 2 ]
+    grep -Fq "Interface wg1 is not authorized" /run/wireguard-reconnect.log
+  ' bash "$REPO_DIR/wireguard-reconnect"
+
+  # Install/uninstall exclusively lock out desktop actions before validation or
+  # any wg-quick/nftables mutation can begin.
+  # shellcheck disable=SC2016 # Inner script intentionally expands in the child shell.
+  unshare -Urnm bash -c '
+    set -e
+    mount -t tmpfs tmpfs /run
+    exec 7>/run/test-install.lock
+    flock -x 7
+    set +e
+    WIREGUARD_INSTALL_LOCK_FILE=/run/test-install.lock \
+      WIREGUARD_INSTALL_LOCK_TIMEOUT=0 "$1" down wg0 >/dev/null 2>&1
+    rc=$?
+    set -e
+    [ "$rc" -eq 1 ]
+    grep -Fq "install/uninstall transaction" /run/wireguard-reconnect.log
   ' bash "$REPO_DIR/wireguard-reconnect"
 fi
 

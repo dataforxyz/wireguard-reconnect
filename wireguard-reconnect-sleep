@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Restart the event monitor after suspend/hibernate. The monitor returns
 # immediately, waits for the physical route, and reconnects only when the VPN
 # was intended to be on before sleep.

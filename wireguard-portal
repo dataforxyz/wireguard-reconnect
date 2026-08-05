@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Fail-closed captive portal orchestrator.
 #
 # Production mode runs as root, creates an isolated network namespace, launches
@@ -26,8 +27,8 @@ PORTAL_LOCK="/run/wireguard-portal.lock"
 PORTAL_LOG="/run/wireguard-portal.log"
 PORTAL_ENDPOINT_CANDIDATE="/run/wg-killswitch.portal-candidate"
 PERSISTENT_ENDPOINT_CACHE="/var/lib/wg-killswitch/endpoint"
-CHECK_URL="http://connectivitycheck.gstatic.com/generate_204"
-SECONDARY_CHECK_URL="http://cp.cloudflare.com/generate_204"
+CHECK_URL="${WIREGUARD_PORTAL_CHECK_URL_PRIMARY:-http://connectivitycheck.gstatic.com/generate_204}"
+SECONDARY_CHECK_URL="${WIREGUARD_PORTAL_CHECK_URL_SECONDARY:-http://cp.cloudflare.com/generate_204}"
 CHECK_TIMEOUT=5
 POLL_INTERVAL=2
 PORTAL_TIMEOUT=600
@@ -175,11 +176,11 @@ capture_forwarding_state() {
     physical_key="net.ipv4.conf.${physical}.forwarding"
     PORTAL_FORWARD_PREVIOUS="$(sysctl -n "$portal_key" 2>/dev/null || true)"
     PHYSICAL_FORWARD_PREVIOUS="$(sysctl -n "$physical_key" 2>/dev/null || true)"
-    [[ "$PORTAL_FORWARD_PREVIOUS" =~ ^[01]$ ]] && \
-      [[ "$PHYSICAL_FORWARD_PREVIOUS" =~ ^[01]$ ]] || {
+    if ! [[ "$PORTAL_FORWARD_PREVIOUS" =~ ^[01]$ ]] || \
+       ! [[ "$PHYSICAL_FORWARD_PREVIOUS" =~ ^[01]$ ]]; then
         log "could not read per-interface IPv4 forwarding state"
         return 1
-    }
+    fi
     PHYSICAL_IFACE="$physical"
     {
         printf 'PHYSICAL_IFACE=%s\n' "$PHYSICAL_IFACE"
@@ -287,7 +288,7 @@ refresh_endpoint_cache() {
         endpoint4="$(ip netns exec "$NS" getent ahostsv4 "$host" 2>/dev/null | awk 'NF {print $1; exit}' || true)"
     fi
     [[ "$endpoint4" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || {
-        log "portal DNS could not resolve the WireGuard endpoint $host"
+        log "portal DNS could not resolve the configured WireGuard endpoint"
         return 1
     }
 
@@ -416,16 +417,16 @@ launch_browser() {
     runtime="/run/user/$CALLER_UID"
     wayland="$(find "$runtime" -maxdepth 1 -type s -name 'wayland-*' -printf '%f\n' 2>/dev/null | head -n1)"
     browser="$(browser_binary)" || { log "no supported Chromium-family browser found"; return 1; }
-    [ -n "$user" ] && [ -n "$wayland" ] || {
+    if [ -z "$user" ] || [ -z "$wayland" ]; then
         log "could not determine the active Wayland desktop session for uid $CALLER_UID"
         return 1
-    }
+    fi
 
     PROFILE_DIR="$(mktemp -d "$runtime/wireguard-portal.XXXXXX")"
     printf 'PROFILE_DIR=%s\n' "$PROFILE_DIR" >>"$PORTAL_STATE"
     chown -R "$CALLER_UID:$(id -g "$user")" "$PROFILE_DIR"
 
-    log "opening ephemeral portal browser for $url"
+    log "opening ephemeral portal browser"
     setsid ip netns exec "$NS" runuser -u "$user" -- env \
         HOME="$PROFILE_DIR" USER="$user" LOGNAME="$user" \
         XDG_RUNTIME_DIR="$runtime" WAYLAND_DISPLAY="$wayland" \
@@ -454,10 +455,10 @@ run_portal() {
     trap early_exit_cleanup EXIT
     trap 'exit 130' HUP INT TERM
     valid_iface "$IFACE" || { echo "Invalid interface: $IFACE" >&2; return 2; }
-    [[ "$CALLER_UID" =~ ^[0-9]+$ ]] && [ "$CALLER_UID" -ge 1000 ] || {
+    if ! [[ "$CALLER_UID" =~ ^[0-9]+$ ]] || [ "$CALLER_UID" -lt 1000 ]; then
         echo "Could not determine the invoking desktop user" >&2
         return 2
-    }
+    fi
     active_local_graphical_session "$CALLER_UID" || {
         echo "Invoking user is not the active local graphical session" >&2
         return 2
@@ -469,7 +470,7 @@ run_portal() {
     network_id="$(network_fingerprint "$physical")"
 
     : >"$PORTAL_LOG"
-    chmod 0644 "$PORTAL_LOG"
+    chmod 0600 "$PORTAL_LOG"
     cleanup_namespace
     trap 'abort_portal 130' HUP INT TERM
     trap 'if [ "$NETNS_READY" = 1 ]; then abort_portal 1; else early_exit_cleanup; fi' EXIT
@@ -478,7 +479,7 @@ run_portal() {
     NETNS_READY=1
     printf 'PHYSICAL_IFACE=%s\nCALLER_UID=%s\nSTARTED=%s\n' \
         "$physical" "$CALLER_UID" "$(date -Is)" >"$PORTAL_STATE"
-    chmod 0644 "$PORTAL_STATE"
+    chmod 0600 "$PORTAL_STATE"
     refresh_waybar
 
     # The parent reconnect helper pre-arms and verifies the host kill switch.
@@ -500,7 +501,7 @@ run_portal() {
     enable_forwarding || abort_portal 1
     primary_code="$(probe_code "$NS" "$CHECK_URL")"
     secondary_code="$(probe_code "$NS" "$SECONDARY_CHECK_URL")"
-    code="gstatic=${primary_code:-000} cloudflare=${secondary_code:-000}"
+    code="primary=${primary_code:-000} secondary=${secondary_code:-000}"
     if [ "$primary_code" = "204" ] && [ "$secondary_code" = "204" ]; then
         log "no captive portal detected; independent probes returned HTTP 204 ($code)"
     elif portal_interception_detected "$primary_code" "$secondary_code"; then
@@ -562,7 +563,9 @@ simulate_portal() {
         location="$(curl --silent --show-error --max-time 3 --output /dev/null --write-out '%{redirect_url}' "$url" 2>/dev/null || true)"
         echo "SIMULATE: captive portal detected; isolated browser would open ${location:-$url}"
         # Visiting the redirect simulates completing the local test portal.
-        [ -n "$location" ] && curl --silent --show-error --max-time 3 "$location" >/dev/null 2>&1 || true
+        if [ -n "$location" ]; then
+            curl --silent --show-error --max-time 3 "$location" >/dev/null 2>&1 || true
+        fi
         while [ "$elapsed" -lt 10 ]; do
             sleep 1
             elapsed=$((elapsed + 1))

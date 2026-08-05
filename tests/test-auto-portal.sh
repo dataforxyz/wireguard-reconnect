@@ -110,6 +110,7 @@ fi
 
 run_monitor
 grep -Fxq 'uid=1000 inherited=1 args=portal wg0' "$TMP/run/calls"
+[ "$(stat -c '%a' "$TMP/run/stamp")" = "600" ]
 
 # Same BSSID is rate-limited.
 run_monitor || true
@@ -160,5 +161,6 @@ wait "$first" || true
 wait "$second" || true
 test "$(wc -l <"$TMP/run/calls")" -eq 1
 
-grep -Fq 'repair_if_needed "periodic Wi-Fi health check" &' "$REPO_DIR/wireguard-monitor"
+grep -Fq 'exec 9>/run/wireguard-monitor.portal-scan.lock' "$REPO_DIR/wireguard-monitor"
+grep -Fq 'repair_if_needed "periodic Wi-Fi health check"' "$REPO_DIR/wireguard-monitor"
 printf 'automatic Wi-Fi captive portal detection tests: OK\n'

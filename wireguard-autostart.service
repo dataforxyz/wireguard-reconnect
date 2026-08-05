@@ -5,6 +5,7 @@ Wants=wireguard-killswitch.service wireguard-monitor.service
 
 [Service]
 Type=oneshot
+EnvironmentFile=/etc/wireguard-reconnect/environment
 ExecStart=/usr/local/bin/wireguard-autostart
 RemainAfterExit=yes
 

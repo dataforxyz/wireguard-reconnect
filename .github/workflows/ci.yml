@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck nftables iproute2 wireguard-tools curl python3 util-linux
+      - name: Bash syntax
+        run: |
+          bash -n install.sh uninstall.sh wg-killswitch wireguard-autostart \
+            wireguard-monitor wireguard-portal wireguard-reconnect \
+            wireguard-reconnect-sleep wireguard-status tests/*.sh
+      - name: ShellCheck
+        run: |
+          shellcheck install.sh uninstall.sh wg-killswitch wireguard-autostart \
+            wireguard-monitor wireguard-portal wireguard-reconnect \
+            wireguard-reconnect-sleep wireguard-status tests/*.sh
+      - name: Regression suite
+        run: make test
+      - name: Require kernel namespace/nftables isolation test
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 2>/dev/null || true
+          output="$(./tests/test-portal-netns.sh)"
+          printf '%s\n' "$output"
+          grep -Fq 'portal namespace kernel isolation test: OK' <<<"$output"
+      - name: Verify systemd units
+        run: |
+          sudo install -Dm755 ./wg-killswitch /usr/local/bin/wg-killswitch
+          sudo install -Dm755 ./wireguard-monitor /usr/local/bin/wireguard-monitor
+          sudo install -Dm755 ./wireguard-autostart /usr/local/bin/wireguard-autostart
+          sudo install -d -m 0700 /etc/wireguard-reconnect
+          printf 'WIREGUARD_INTERFACE=wg0\nWIREGUARD_TAILSCALE_ENABLED=0\n' | \
+            sudo tee /etc/wireguard-reconnect/environment >/dev/null
+          systemd-analyze verify ./wireguard-killswitch.service ./wireguard-monitor.service ./wireguard-autostart.service
+      - name: Whitespace check
+        run: git diff --check
+
+  portal-container-simulation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Run Docker-backed captive-portal simulation
+        run: make portal-container-simulate

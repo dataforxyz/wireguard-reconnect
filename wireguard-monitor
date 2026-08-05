@@ -1,4 +1,5 @@
 #!/bin/bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Event-driven WireGuard repair for iwd/systemd-networkd laptops.
 #
 # The process watches physical route/link/address changes. It waits for the
@@ -23,6 +24,7 @@ AUTO_PORTAL="${WIREGUARD_AUTO_PORTAL:-1}"
 PORTAL_USER_FILE="${WIREGUARD_PORTAL_USER_FILE:-/etc/wireguard-reconnect/portal-user}"
 PORTAL_COOLDOWN="${WIREGUARD_PORTAL_COOLDOWN:-300}"
 PORTAL_GLOBAL_COOLDOWN="${WIREGUARD_PORTAL_GLOBAL_COOLDOWN:-30}"
+PORTAL_SCAN_INTERVAL="${WIREGUARD_PORTAL_SCAN_INTERVAL:-60}"
 PORTAL_STAMP="${WIREGUARD_PORTAL_STAMP:-/run/wireguard-portal.autodetect}"
 IW_BIN="${WIREGUARD_IW_BIN:-/usr/bin/iw}"
 LOGINCTL_BIN="${WIREGUARD_LOGINCTL_BIN:-/usr/bin/loginctl}"
@@ -33,7 +35,9 @@ RECONNECT_LOCK="${WIREGUARD_RECONNECT_LOCK:-/run/wireguard-reconnect.lock}"
 GUARD_CHECK_INTERVAL="${WIREGUARD_GUARD_CHECK_INTERVAL:-15}"
 [[ "$PORTAL_COOLDOWN" =~ ^[0-9]+$ ]] || PORTAL_COOLDOWN=300
 [[ "$PORTAL_GLOBAL_COOLDOWN" =~ ^[0-9]+$ ]] || PORTAL_GLOBAL_COOLDOWN=30
+[[ "$PORTAL_SCAN_INTERVAL" =~ ^[0-9]+$ ]] || PORTAL_SCAN_INTERVAL=60
 LAST_TRIGGER=0
+LAST_PORTAL_SCAN=0
 
 log() {
     logger -t wireguard-monitor "$*" 2>/dev/null || true
@@ -120,7 +124,7 @@ portal_cooldown_ready() (
         return 1
     fi
     printf '%s\n%s\n' "$now" "$fingerprint" >"$PORTAL_STAMP"
-    chmod 0644 "$PORTAL_STAMP" 2>/dev/null || true
+    chmod 0600 "$PORTAL_STAMP" 2>/dev/null || true
 )
 
 maybe_auto_portal() (
@@ -211,6 +215,7 @@ trigger_repair() {
 }
 
 guard_watchdog() {
+    local now
     while sleep "$GUARD_CHECK_INTERVAL"; do
         vpn_intended_on || continue
         [ -x "$KILLSWITCH_HELPER" ] || continue
@@ -248,12 +253,19 @@ guard_watchdog() {
         # roaming always get a protected reconnect attempt before portal mode
         # is considered; portal detection is only the fallback after that
         # reconnect remains offline.
-        if [ ! -f "$PORTAL_STATE" ] && vpn_intended_on && underlay_online && ! vpn_online; then
-            # Keep repair/portal orchestration outside the sole watchdog loop.
-            # ACTION_LOCK makes repeated checks cheap no-ops while a long portal
-            # login is active, while this parent continues verifying nftables
-            # protection every GUARD_CHECK_INTERVAL seconds.
-            repair_if_needed "periodic Wi-Fi health check" &
+        now="$(date +%s)"
+        if (( now - LAST_PORTAL_SCAN >= PORTAL_SCAN_INTERVAL )); then
+            LAST_PORTAL_SCAN="$now"
+            # The external curl and any follow-up repair run in a separately
+            # serialized worker. The parent returns immediately to its 15s local
+            # nftables cadence regardless of probe timeout.
+            (
+                exec 9>/run/wireguard-monitor.portal-scan.lock
+                flock -n 9 || exit 0
+                if [ ! -f "$PORTAL_STATE" ] && vpn_intended_on && underlay_online && ! vpn_online; then
+                    repair_if_needed "periodic Wi-Fi health check"
+                fi
+            ) &
         fi
     done
 }

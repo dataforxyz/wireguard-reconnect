@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
 # Dedicated nftables kill switch for the local WireGuard full-tunnel setup.
 #
 # Enabled state means: while WireGuard is intended to be active, local public
@@ -12,6 +13,7 @@ TABLE_FAMILY="${WG_KILLSWITCH_TABLE_FAMILY:-inet}"
 TABLE_NAME="${WG_KILLSWITCH_TABLE_NAME:-wg_killswitch}"
 STATE_FILE="${WG_KILLSWITCH_STATE_FILE:-/run/wg-killswitch.enabled}"
 ROLLBACK_TOKEN_FILE="${WG_KILLSWITCH_ROLLBACK_TOKEN_FILE:-/run/wg-killswitch.rollback-token}"
+ROLLBACK_LOCK_FILE="${WG_KILLSWITCH_ROLLBACK_LOCK_FILE:-/run/wg-killswitch.rollback.lock}"
 ENDPOINT_STATE_FILE="${WG_KILLSWITCH_ENDPOINT_STATE_FILE:-/run/wg-killswitch.endpoint}"
 PERSISTENT_STATE_DIR="${WG_KILLSWITCH_PERSISTENT_STATE_DIR:-/var/lib/wg-killswitch}"
 PERSISTENT_ENDPOINT_STATE_FILE="$PERSISTENT_STATE_DIR/endpoint"
@@ -20,6 +22,7 @@ LOG_FILE="${WG_KILLSWITCH_LOG_FILE:-/run/wg-killswitch.log}"
 LOG_MAX_BYTES="${WG_KILLSWITCH_LOG_MAX_BYTES:-262144}"
 LOG_KEEP_LINES="${WG_KILLSWITCH_LOG_KEEP_LINES:-1000}"
 WG_CONFIG_DIR="${WG_CONFIG_DIR:-/etc/wireguard}"
+SELF_PATH="${WG_KILLSWITCH_SELF_PATH:-/usr/local/bin/wg-killswitch}"
 DEFAULT_IFACE="${WIREGUARD_INTERFACE:-wg0}"
 PORTAL_HOST_IFACE="${WIREGUARD_PORTAL_HOST_IFACE:-wgportal0}"
 DEFAULT_WG_MARK="0xca6c"
@@ -27,6 +30,10 @@ TAILSCALE_MARK_MASK="0x00ff0000"
 TAILSCALE_MARK_VALUE="0x00080000"
 [[ "$LOG_MAX_BYTES" =~ ^[0-9]+$ ]] || LOG_MAX_BYTES=262144
 [[ "$LOG_KEEP_LINES" =~ ^[0-9]+$ ]] || LOG_KEEP_LINES=1000
+
+umask 077
+: 2>/dev/null >>"$LOG_FILE" || true
+chmod 0600 "$LOG_FILE" 2>/dev/null || true
 
 log() {
   local message="$*" size tmp
@@ -37,7 +44,7 @@ log() {
     if [[ "$size" =~ ^[0-9]+$ ]] && (( size > LOG_MAX_BYTES )); then
       tmp="${LOG_FILE}.trim.$$"
       tail -n "$LOG_KEEP_LINES" "$LOG_FILE" >"$tmp"
-      chmod 0644 "$tmp" 2>/dev/null || true
+      chmod 0600 "$tmp" 2>/dev/null || true
       mv -f "$tmp" "$LOG_FILE"
     fi
   } 200>"${LOG_FILE}.lock"
@@ -151,18 +158,6 @@ csv_or_empty() {
   done
 }
 
-remove_public_dns_host_routes() {
-  # systemd-networkd/resolved sometimes leaves public DNS host routes (for
-  # example 1.1.1.1/8.8.8.8) in main via wlan0. Those beat wg-quick's
-  # full-tunnel rule and become leaks unless removed or blocked. Remove the
-  # common public resolver host routes when they are present; LAN DNS remains
-  # allowed by the nft private ranges.
-  local ip
-  for ip in 1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 9.9.9.9 149.112.112.112 208.67.222.222 208.67.220.220; do
-    while ip -4 route del "$ip" table main 2>/dev/null; do :; done
-  done
-}
-
 install_emergency_guard() {
   local iface="$1" mark="$2" prelude tmp
   if has_table; then
@@ -251,7 +246,7 @@ enable_rules() {
       ep4="$(state_value "$PORTAL_CANDIDATE_STATE_FILE" ENDPOINT4)"
       ep6="$(state_value "$PORTAL_CANDIDATE_STATE_FILE" ENDPOINT6)"
       used_portal_candidate=1
-      log "using portal candidate for atomic protected restore: ${host}:${port}"
+      log "using isolated portal endpoint candidate for atomic protected restore"
     fi
   fi
 
@@ -266,7 +261,7 @@ enable_rules() {
       ep4="$(state_value "$PERSISTENT_ENDPOINT_STATE_FILE" ENDPOINT4)"
       ep6="$(state_value "$PERSISTENT_ENDPOINT_STATE_FILE" ENDPOINT6)"
       used_persistent_cache=1
-      log "using persistent endpoint cache before blocked DNS lookup: ${host}:${port}"
+      log "using traffic-verified endpoint cache before blocked DNS lookup"
     fi
   fi
 
@@ -281,12 +276,12 @@ enable_rules() {
       ep4="$(state_value "$ENDPOINT_STATE_FILE" ENDPOINT4)"
       ep6="$(state_value "$ENDPOINT_STATE_FILE" ENDPOINT6)"
       used_runtime_candidate=1
-      log "reusing unverified runtime endpoint candidate without DNS: ${host}:${port}"
+      log "reusing runtime endpoint candidate without DNS"
     fi
   fi
 
   if [[ -z "$ep4" && -z "$ep6" && -n "$host" ]]; then
-    log "attempting endpoint DNS resolution before guard refresh: ${host}:${port}"
+    log "attempting configured endpoint DNS resolution before guard refresh"
     ep4="$(resolve_endpoint_ips "$host" 4 | csv_or_empty || true)"
     ep6="$(resolve_endpoint_ips "$host" 6 | csv_or_empty || true)"
   fi
@@ -302,7 +297,7 @@ enable_rules() {
       ep4="$(state_value "$PERSISTENT_ENDPOINT_STATE_FILE" ENDPOINT4)"
       ep6="$(state_value "$PERSISTENT_ENDPOINT_STATE_FILE" ENDPOINT6)"
       used_persistent_cache=1
-      log "using persistent endpoint cache after DNS failure: ${host}:${port}"
+      log "using traffic-verified endpoint cache after DNS failure"
     fi
   fi
 
@@ -320,7 +315,6 @@ enable_rules() {
     unresolved=1
   fi
 
-  remove_public_dns_host_routes || true
 
   if has_table; then
     table_prelude="flush table $TABLE_FAMILY $TABLE_NAME"
@@ -402,7 +396,7 @@ EOF
       printf 'ENDPOINT6=%s\n' "$ep6_first"
       printf 'WG_MARK=%s\n' "$mark"
     } > "$ENDPOINT_STATE_FILE"
-    chmod 0644 "$ENDPOINT_STATE_FILE" 2>/dev/null || true
+    chmod 0600 "$ENDPOINT_STATE_FILE" 2>/dev/null || true
   fi
 
   printf '%s\n' "$iface" > "$STATE_FILE"
@@ -427,17 +421,50 @@ EOF
   else
     log "enabled with DNS endpoint candidate; deferring persistent cache promotion until WireGuard traffic is verified"
   fi
-  log "enabled and verified iface=$iface endpoint=${host}:${port} ep4=${ep4:-none} ep6=${ep6:-none} mark=$mark"
+  log "enabled and verified iface=$iface endpoint-rule=$([ -n "$ep4$ep6" ] && echo present || echo absent) mark=$mark"
 }
 
 disable_rules() {
-  nft delete table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null || true
+  local presence_rc
+  table_presence || presence_rc=$?
+  presence_rc="${presence_rc:-0}"
+  if [[ "$presence_rc" == "2" ]]; then
+    log "disable failed: nftables state could not be queried; state retained"
+    return 1
+  fi
+  if [[ "$presence_rc" == "0" ]]; then
+    if ! nft delete table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null; then
+      log "disable failed: nftables table could not be deleted; state retained"
+      return 1
+    fi
+  fi
+  presence_rc=0
+  table_presence || presence_rc=$?
+  if [[ "$presence_rc" == "2" ]]; then
+    log "disable failed: nftables removal could not be verified; state retained"
+    return 1
+  fi
+  if [[ "$presence_rc" == "0" ]]; then
+    log "disable failed: nftables table still exists; state retained"
+    return 1
+  fi
   rm -f "$STATE_FILE" "$ROLLBACK_TOKEN_FILE" "$ENDPOINT_STATE_FILE" "$PORTAL_CANDIDATE_STATE_FILE"
-  log "disabled"
+  log "disabled and verified"
+}
+
+table_presence() {
+  local tables
+  tables="$(nft list tables 2>/dev/null)" || return 2
+  if grep -Fxq "table $TABLE_FAMILY $TABLE_NAME" <<<"$tables"; then
+    return 0
+  fi
+  return 1
 }
 
 has_table() {
-  nft list table "$TABLE_FAMILY" "$TABLE_NAME" >/dev/null 2>&1
+  local rc=0
+  table_presence || rc=$?
+  [ "$rc" -eq 0 ]
 }
 
 verify_portal_rules() {
@@ -462,7 +489,7 @@ verify_rules() {
 }
 
 status_rules() {
-  local mode="${1:-full}" iface=""
+  local mode="${1:-full}" iface="" presence_rc=0
   [[ -f "$STATE_FILE" ]] && iface="$(cat "$STATE_FILE" 2>/dev/null || true)"
   if [[ "$mode" == "portal" ]] && verify_portal_rules; then
     echo "portal-ready verified iface=${iface:-unknown}"
@@ -470,29 +497,59 @@ status_rules() {
   elif [[ "$mode" == "full" ]] && verify_rules; then
     echo "enabled verified iface=${iface:-unknown}"
     nft list table "$TABLE_FAMILY" "$TABLE_NAME" 2>/dev/null | sed -n '1,140p'
-  elif has_table; then
-    echo "blocked-unready iface=${iface:-unknown}"
-    return 1
   else
-    echo "disabled"
+    table_presence || presence_rc=$?
+    if [[ "$presence_rc" == "0" ]]; then
+      echo "blocked-unready iface=${iface:-unknown}"
+    elif [[ "$presence_rc" == "2" ]]; then
+      echo "unknown: nftables state query failed"
+    else
+      echo "disabled"
+    fi
     return 1
   fi
 }
 
+confirm_rollback() {
+  exec 201>"$ROLLBACK_LOCK_FILE"
+  flock -x 201
+  rm -f "$ROLLBACK_TOKEN_FILE"
+}
+
 schedule_rollback() {
   local seconds="${WG_KILLSWITCH_ROLLBACK_SECONDS:-90}" token
+  local rollback_action="${WG_KILLSWITCH_ROLLBACK_ACTION:-disable}"
+  local rollback_iface="${WG_KILLSWITCH_ROLLBACK_INTERFACE:-}"
   [[ "$seconds" =~ ^[0-9]+$ ]] || seconds=90
+  case "$rollback_action" in
+    disable) ;;
+    rearm)
+      [[ "$rollback_iface" =~ ^wg[0-9]+$ ]] || die "rollback rearm requires a valid interface"
+      ;;
+    *) die "invalid rollback action: $rollback_action" ;;
+  esac
   token="$(date +%s)-$$-$RANDOM"
-  printf '%s\n' "$token" > "$ROLLBACK_TOKEN_FILE"
-  chmod 0644 "$ROLLBACK_TOKEN_FILE" 2>/dev/null || true
+  exec 201>"$ROLLBACK_LOCK_FILE"
+  flock -x 201
+  printf '%s\n' "$token" >"$ROLLBACK_TOKEN_FILE"
+  chmod 0600 "$ROLLBACK_TOKEN_FILE" 2>/dev/null || true
+  flock -u 201
   (
     sleep "$seconds"
+    exec 201>"$ROLLBACK_LOCK_FILE"
+    flock -x 201
     if [[ -f "$ROLLBACK_TOKEN_FILE" ]] && [[ "$(cat "$ROLLBACK_TOKEN_FILE" 2>/dev/null || true)" == "$token" ]]; then
-      /usr/local/bin/wg-killswitch disable
-      logger -t wg-killswitch "rollback disabled kill switch after ${seconds}s without confirm"
+      if [[ "$rollback_action" == "rearm" ]]; then
+        "$SELF_PATH" enable "$rollback_iface" || true
+        logger -t wg-killswitch "rollback re-armed prior interface after ${seconds}s without confirm"
+      else
+        "$SELF_PATH" disable
+        logger -t wg-killswitch "rollback disabled fresh-install kill switch after ${seconds}s without confirm"
+      fi
+      rm -f "$ROLLBACK_TOKEN_FILE"
     fi
   ) >/dev/null 2>&1 &
-  log "rollback scheduled seconds=$seconds token=$token"
+  log "rollback scheduled seconds=$seconds action=$rollback_action"
 }
 
 main() {
@@ -506,7 +563,7 @@ main() {
       schedule_rollback
       ;;
     confirm)
-      rm -f "$ROLLBACK_TOKEN_FILE"
+      confirm_rollback
       log "confirmed"
       ;;
     refresh)
