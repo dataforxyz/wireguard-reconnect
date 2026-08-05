@@ -23,6 +23,7 @@ PORTAL_STATE="/run/wireguard-portal.active"
 KILLSWITCH_ENABLED="${WIREGUARD_KILLSWITCH:-1}"
 KILLSWITCH_STATE="/run/wg-killswitch.enabled"
 KILLSWITCH_ENDPOINT_STATE="/run/wg-killswitch.endpoint"
+PORTAL_ENDPOINT_CANDIDATE="/run/wg-killswitch.portal-candidate"
 BOOTSTRAP_DIR="/run/wireguard-reconnect"
 TAILSCALE_OPERATOR="${TAILSCALE_OPERATOR:-dxyz}"
 CHECK_URL="${WIREGUARD_CHECK_URL:-http://connectivitycheck.gstatic.com/generate_204}"
@@ -152,8 +153,8 @@ kill_switch_active() {
 }
 
 state_value() {
-    local key="$1"
-    /usr/bin/awk -F= -v key="$key" '$1 == key {print substr($0, length(key) + 2); exit}' "$KILLSWITCH_ENDPOINT_STATE" 2>/dev/null
+    local key="$1" file="${2:-$KILLSWITCH_ENDPOINT_STATE}"
+    /usr/bin/awk -F= -v key="$key" '$1 == key {print substr($0, length(key) + 2); exit}' "$file" 2>/dev/null
 }
 
 bootstrap_config_for_up() {
@@ -162,15 +163,20 @@ bootstrap_config_for_up() {
     # that state, so reuse the last endpoint IP that wg-killswitch recorded
     # while the tunnel was healthy. This keeps reconnect bootstrap limited to
     # the WireGuard server endpoint, not general public internet/DNS.
-    local port ep4 ep6 endpoint tmp
+    local port ep4 ep6 endpoint tmp endpoint_state="$KILLSWITCH_ENDPOINT_STATE" cache_label="runtime"
     if ! kill_switch_active; then
         printf '%s\n' "$WG_CONF"
         return 0
     fi
 
-    port="$(state_value ENDPOINT_PORT)"
-    ep4="$(state_value ENDPOINT4)"
-    ep6="$(state_value ENDPOINT6)"
+    if [ "${WIREGUARD_PORTAL_RESTORE:-0}" = "1" ] && [ -r "$PORTAL_ENDPOINT_CANDIDATE" ]; then
+        endpoint_state="$PORTAL_ENDPOINT_CANDIDATE"
+        cache_label="isolated portal candidate"
+    fi
+
+    port="$(state_value ENDPOINT_PORT "$endpoint_state")"
+    ep4="$(state_value ENDPOINT4 "$endpoint_state")"
+    ep6="$(state_value ENDPOINT6 "$endpoint_state")"
     endpoint=""
     if [ -n "$ep4" ] && [ -n "$port" ]; then
         endpoint="${ep4}:${port}"
@@ -190,7 +196,7 @@ bootstrap_config_for_up() {
         { print }
     ' "$WG_CONF" > "$tmp"
     /usr/bin/chmod 0600 "$tmp"
-    echo "[#] using cached WireGuard endpoint for kill-switch bootstrap: $endpoint" >>"$LOG_FILE"
+    echo "[#] using $cache_label WireGuard endpoint for kill-switch bootstrap: $endpoint" >>"$LOG_FILE"
     printf '%s\n' "$tmp"
 }
 

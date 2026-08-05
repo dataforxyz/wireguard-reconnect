@@ -165,6 +165,7 @@ EOF
 grep -q '203.0.113.30.*udp dport 51820 accept' "$NFT_CAPTURE"
 test ! -s "$GETENT_CALL_LOG"
 rm -f "$WG_KILLSWITCH_PERSISTENT_STATE_DIR/endpoint"
+cp "$WG_KILLSWITCH_ENDPOINT_STATE_FILE" "$TMP/run/ordinary-endpoint-before-portal"
 
 # A portal DNS result is usable for the immediate protected bootstrap but must
 # not replace the last verified persistent cache before WG traffic succeeds.
@@ -185,6 +186,20 @@ if grep -q '198.51.100.50.*udp dport 51820 accept' "$NFT_CAPTURE"; then
   exit 1
 fi
 test ! -e "$TMP/state/endpoint"
+cmp -s "$WG_KILLSWITCH_ENDPOINT_STATE_FILE" "$TMP/run/ordinary-endpoint-before-portal"
+
+# Discarding a failed portal candidate must return ordinary reconnects to the
+# prior generic runtime state; the portal IP cannot leak across provenance.
+rm -f "$WG_KILLSWITCH_PORTAL_CANDIDATE_STATE_FILE"
+: >"$GETENT_CALL_LOG"
+"$REPO_DIR/wg-killswitch" enable wg0
+"$REPO_DIR/wg-killswitch" status >/dev/null
+grep -q '203.0.113.30.*udp dport 51820 accept' "$NFT_CAPTURE"
+if grep -q '203.0.113.20.*udp dport 51820 accept' "$NFT_CAPTURE"; then
+  echo "discarded portal candidate leaked into ordinary reconnect state" >&2
+  exit 1
+fi
+test ! -s "$GETENT_CALL_LOG"
 unset GETENT_IPV4
 
 # A rejected full ruleset must fall back to a smaller emergency policy-drop
@@ -212,5 +227,7 @@ test "$(wc -l <"$WG_KILLSWITCH_LOG_FILE")" -le 2
 # shellcheck disable=SC2016 # Assert literal production-script source text.
 grep -Fq 'WIREGUARD_ENDPOINT_VERIFIED="$endpoint_verified"' "$REPO_DIR/wireguard-reconnect"
 grep -Fq 'if vpn_traffic_verified; then' "$REPO_DIR/wireguard-reconnect"
+# shellcheck disable=SC2016 # Assert literal production-script source text.
+grep -Fq 'endpoint_state="$PORTAL_ENDPOINT_CANDIDATE"' "$REPO_DIR/wireguard-reconnect"
 
 printf 'kill-switch fail-closed tests: OK\n'

@@ -389,15 +389,21 @@ EOF
 
   ep4_first="${ep4%%,*}"
   ep6_first="${ep6%%,*}"
-  {
-    printf 'IFACE=%s\n' "$iface"
-    printf 'ENDPOINT_HOST=%s\n' "${host:-}"
-    printf 'ENDPOINT_PORT=%s\n' "${port:-}"
-    printf 'ENDPOINT4=%s\n' "$ep4_first"
-    printf 'ENDPOINT6=%s\n' "$ep6_first"
-    printf 'WG_MARK=%s\n' "$mark"
-  } > "$ENDPOINT_STATE_FILE"
-  chmod 0644 "$ENDPOINT_STATE_FILE" 2>/dev/null || true
+  # The portal candidate has separate provenance and must never overwrite the
+  # generic runtime endpoint state. The portal restore wrapper reads its own
+  # candidate file explicitly, while a failed portal leaves the prior ordinary
+  # reconnect state intact.
+  if (( ! used_portal_candidate )); then
+    {
+      printf 'IFACE=%s\n' "$iface"
+      printf 'ENDPOINT_HOST=%s\n' "${host:-}"
+      printf 'ENDPOINT_PORT=%s\n' "${port:-}"
+      printf 'ENDPOINT4=%s\n' "$ep4_first"
+      printf 'ENDPOINT6=%s\n' "$ep6_first"
+      printf 'WG_MARK=%s\n' "$mark"
+    } > "$ENDPOINT_STATE_FILE"
+    chmod 0644 "$ENDPOINT_STATE_FILE" 2>/dev/null || true
+  fi
 
   printf '%s\n' "$iface" > "$STATE_FILE"
   chmod 0644 "$STATE_FILE" 2>/dev/null || true
@@ -407,13 +413,13 @@ EOF
     return 1
   fi
 
-  if [[ "${WIREGUARD_ENDPOINT_VERIFIED:-0}" == "1" ]]; then
+  if (( used_portal_candidate )); then
+    log "enabled with isolated portal endpoint candidate; generic and persistent caches remain unchanged"
+  elif [[ "${WIREGUARD_ENDPOINT_VERIFIED:-0}" == "1" ]]; then
     install -d -m 0700 "$PERSISTENT_STATE_DIR"
     cp "$ENDPOINT_STATE_FILE" "$PERSISTENT_ENDPOINT_STATE_FILE"
     chmod 0600 "$PERSISTENT_ENDPOINT_STATE_FILE"
     log "promoted endpoint cache after verified WireGuard traffic"
-  elif (( used_portal_candidate )); then
-    log "enabled with unverified portal endpoint candidate; deferring persistent cache promotion"
   elif (( used_runtime_candidate )); then
     log "enabled with unverified runtime endpoint candidate; deferring persistent cache promotion"
   elif (( used_persistent_cache )); then
