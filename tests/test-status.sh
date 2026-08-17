@@ -35,10 +35,17 @@ cat >"$TMP/bin/notify-send" <<'EOF'
 exit 0
 EOF
 
+cat >"$TMP/bin/walker" <<'EOF'
+#!/bin/bash
+cat >"$STATUS_MENU_LOG"
+printf '%s\n' "${STATUS_MENU_SELECTION:-}"
+EOF
+
 chmod +x "$TMP/bin/"*
 
 export PATH="$TMP/bin:/usr/bin:/bin"
 export STATUS_CALL_LOG="$TMP/run/calls"
+export STATUS_MENU_LOG="$TMP/run/menu"
 export WIREGUARD_RECONNECT_HELPER="$TMP/bin/helper"
 export WIREGUARD_PORTAL_STATE="$TMP/run/portal.active"
 export WIREGUARD_KILLSWITCH_STATE="$TMP/run/guard"
@@ -53,6 +60,25 @@ printf 'wg1\n' >"$TMP/run/interface"
 : >"$STATUS_CALL_LOG"
 WIREGUARD_PUBLIC_INTERFACE_FILE="$TMP/run/interface" "$REPO_DIR/wireguard-status" disconnect
 grep -Fxq "$TMP/bin/helper down wg1" "$STATUS_CALL_LOG"
+
+# Yellow/missing-but-intended state opens a recovery menu instead of blindly
+# reconnecting. Every advertised choice maps to a direct installed command.
+touch "$WIREGUARD_INTENT_STATE"
+: >"$STATUS_CALL_LOG"
+STATUS_MENU_SELECTION='Restart WireGuard' "$REPO_DIR/wireguard-status" toggle
+grep -Fxq "$TMP/bin/helper reconnect wg0" "$STATUS_CALL_LOG"
+grep -Fxq 'Restart WireGuard' "$STATUS_MENU_LOG"
+grep -Fxq 'Check captive portal' "$STATUS_MENU_LOG"
+grep -Fxq 'Disconnect and disable leak protection' "$STATUS_MENU_LOG"
+
+: >"$STATUS_CALL_LOG"
+STATUS_MENU_SELECTION='Check captive portal' "$REPO_DIR/wireguard-status" toggle
+grep -Fxq "$TMP/bin/helper portal wg0" "$STATUS_CALL_LOG"
+
+: >"$STATUS_CALL_LOG"
+STATUS_MENU_SELECTION='Disconnect and disable leak protection' "$REPO_DIR/wireguard-status" toggle
+grep -Fxq "$TMP/bin/helper down wg0" "$STATUS_CALL_LOG"
+rm -f "$WIREGUARD_INTENT_STATE"
 
 touch "$WIREGUARD_PORTAL_STATE"
 portal_status="$("$REPO_DIR/wireguard-status")"
@@ -77,4 +103,4 @@ if grep -Eq 'Left-click|Right-click|left-click|right-click' "$REPO_DIR/wireguard
   exit 1
 fi
 grep -q 'Middle-click' "$REPO_DIR/wireguard-status"
-printf 'status disconnect, portal isolation, and safe-click tests: OK\n'
+printf 'status recovery menu, disconnect, portal isolation, and safe-click tests: OK\n'

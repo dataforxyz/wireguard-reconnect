@@ -7,6 +7,10 @@ All notable public changes are documented here. The project follows
 
 ### Added
 
+- Added a yellow/stale Waybar recovery menu with restart, isolated portal-check,
+  and intentional-disconnect actions.
+- Added transient, cleanup-verified UFW forwarding exceptions for the isolated
+  captive-portal namespace while retaining the nftables DNS/web restrictions.
 - Added persisted installer opt-outs for the kill switch, automatic reconnect,
   boot connection, captive-portal support, automatic portal detection, and the
   install-time connection. Defaults preserve the existing full feature set.

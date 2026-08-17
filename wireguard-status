@@ -21,6 +21,7 @@ KILLSWITCH_STATE="${WIREGUARD_KILLSWITCH_STATE:-/run/wg-killswitch.enabled}"
 INTENT_STATE="${WIREGUARD_INTENT_STATE:-/run/wireguard-reconnect.enabled}"
 PORTAL_STATE="${WIREGUARD_PORTAL_STATE:-/run/wireguard-portal.active}"
 RECONNECT_HELPER="${WIREGUARD_RECONNECT_HELPER:-/usr/local/bin/wireguard-reconnect}"
+RECOVERY_MENU_TITLE="${WIREGUARD_RECOVERY_MENU_TITLE:-VPN recovery}"
 # Self-heal: when enabled, an offline interface can be repaired from the Waybar
 # poll without waiting for a manual click. Installer-owned public flags make the
 # same opt-out apply to the monitor, wake hook, and Waybar path.
@@ -200,6 +201,35 @@ run_wg_action() {
     return "$rc"
 }
 
+recovery_menu() {
+    local selection
+    local -a options=('Restart WireGuard')
+    [ "$PORTAL_ENABLED" = "1" ] && options+=('Check captive portal')
+    options+=('Disconnect and disable leak protection')
+
+    if command -v walker >/dev/null 2>&1; then
+        if ! selection="$(printf '%s\n' "${options[@]}" | \
+            walker --dmenu --selectsingle --placeholder "$RECOVERY_MENU_TITLE" 2>/dev/null)"; then
+            notify -u normal "VPN recovery menu closed" \
+                "Walker did not return a selection. Use wireguard-status reconnect, portal, or disconnect."
+            return 0
+        fi
+    elif command -v zenity >/dev/null 2>&1; then
+        selection="$(zenity --list --title="$RECOVERY_MENU_TITLE" --column=Action \
+            "${options[@]}" 2>/dev/null || true)"
+    else
+        notify -u critical "VPN recovery menu unavailable" \
+            "Install walker or zenity, then use wireguard-status reconnect, portal, or disconnect."
+        return 0
+    fi
+
+    case "$selection" in
+        'Restart WireGuard') reconnect ;;
+        'Check captive portal') portal ;;
+        'Disconnect and disable leak protection') disconnect ;;
+    esac
+}
+
 toggle() {
     local active_iface wg_action target_interface rc
 
@@ -214,12 +244,17 @@ toggle() {
         if vpn_online "$active_iface"; then
             wg_action="down"
         else
-            # If the interface is up but traffic does not work, a normal click
-            # should fix the stale/captive-portal-after-wake state, not merely
-            # leave the user one click away from a reconnect.
-            wg_action="reconnect"
+            # Yellow/stale needs an explicit recovery choice. Reconnect is not
+            # always correct on captive networks, while disconnect deliberately
+            # removes the fail-closed guard for troubleshooting.
+            recovery_menu
+            exit $?
         fi
     else
+        if vpn_intended_on; then
+            recovery_menu
+            exit $?
+        fi
         wg_action="up"
         target_interface="$INTERFACE"
     fi
@@ -255,6 +290,21 @@ disconnect() {
         notify "VPN" "WireGuard disconnected: ${target_interface}"
     else
         notify -u critical "VPN disconnect failed" "wg-quick down ${target_interface} failed: $(last_log_line)"
+    fi
+    exit "$rc"
+}
+
+portal() {
+    local active_iface rc
+    active_iface="$(active_interface 2>/dev/null || true)"
+    [ -n "$active_iface" ] || active_iface="$INTERFACE"
+
+    run_wg_action portal "$active_iface"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        notify "VPN" "Captive-portal check completed: ${active_iface}"
+    else
+        notify -u critical "VPN portal check failed" "Protected portal recovery did not restore connectivity: $(last_log_line)"
     fi
     exit "$rc"
 }
@@ -371,7 +421,7 @@ auto_reconnect() {
 }
 
 status() {
-    local iface tooltip gap guard_hint auto_hint portal_hint
+    local iface tooltip gap guard_hint auto_hint recovery_hint
     if kill_switch_intended_on; then
         guard_hint="Kill switch is armed against public fallback"
     else
@@ -385,9 +435,9 @@ status() {
         auto_hint="Automatic reconnect is disabled"
     fi
     if [ "$PORTAL_ENABLED" = "1" ]; then
-        portal_hint="use 'make portal' for isolated login"
+        recovery_hint="restart, portal check, or disconnect"
     else
-        portal_hint="captive-portal support is disabled"
+        recovery_hint="restart or disconnect"
     fi
     if [ -f "$PORTAL_STATE" ]; then
         reset_stale_count
@@ -406,7 +456,7 @@ status() {
             tooltip="VPN: Online (${iface})\\nConnectivity check passed through WireGuard\\nMiddle-click to disconnect"
             echo "{\"text\": \"󰖂\", \"class\": \"connected\", \"tooltip\": \"${tooltip}\"}"
         else
-            tooltip="VPN: Enabled but offline (${iface})\\n$(failure_message)\\n${guard_hint}\\n${auto_hint}\\nMiddle-click to reconnect; ${portal_hint}"
+            tooltip="VPN: Enabled but offline (${iface})\\n$(failure_message)\\n${guard_hint}\\n${auto_hint}\\nMiddle-click for recovery options: ${recovery_hint}"
             echo "{\"text\": \"󰖂\", \"class\": \"stale\", \"tooltip\": \"${tooltip}\"}"
             # Do not bounce wg0 on one missed curl; require consecutive stale
             # polls so transient packet loss/DNS/check-server slowness doesn't
@@ -419,7 +469,7 @@ status() {
         fi
     else
         if vpn_intended_on; then
-            tooltip="VPN: Intended on but interface is missing\\n$(failure_message)\\n${guard_hint}\\n${auto_hint}\\nMiddle-click to reconnect; use 'make reset' to disconnect intentionally"
+            tooltip="VPN: Intended on but interface is missing\\n$(failure_message)\\n${guard_hint}\\n${auto_hint}\\nMiddle-click for recovery options: ${recovery_hint}"
             echo "{\"text\": \"󰖂\", \"class\": \"stale\", \"tooltip\": \"${tooltip}\"}"
             if [ "$AUTORECONNECT" = "1" ] && { [ "$gap" = "1" ] || record_stale_check; }; then
                 nohup "$0" auto-reconnect >/dev/null 2>&1 &
@@ -444,6 +494,9 @@ case "${1:-}" in
         ;;
     reconnect)
         reconnect
+        ;;
+    portal)
+        portal
         ;;
     wake)
         wake

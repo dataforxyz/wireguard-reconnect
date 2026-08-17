@@ -35,6 +35,7 @@ PORTAL_TIMEOUT=600
 RECONNECT_HELPER="/usr/local/bin/wireguard-reconnect"
 IW_BIN="${WIREGUARD_IW_BIN:-/usr/bin/iw}"
 LOGINCTL_BIN="${WIREGUARD_LOGINCTL_BIN:-/usr/bin/loginctl}"
+IPTABLES_BIN="${WIREGUARD_IPTABLES_BIN:-$(command -v iptables 2>/dev/null || true)}"
 BROWSER_PID=""
 PROFILE_DIR=""
 NETNS_READY=0
@@ -198,6 +199,42 @@ enable_forwarding() {
       [ "$(sysctl -n "$physical_key" 2>/dev/null || true)" = "1" ]
 }
 
+remove_ufw_portal_rules() {
+    local physical="${1:-$PHYSICAL_IFACE}"
+    [ -x "$IPTABLES_BIN" ] || return 0
+    [ -n "$physical" ] || return 0
+
+    # UFW's forward hook runs after our nftables base chain, so an nft accept
+    # alone cannot override UFW's later drop. Remove only the exact transient
+    # rules installed for this portal veth; no persistent UFW config is changed.
+    while "$IPTABLES_BIN" -w -C ufw-user-forward -i "$HOST_IFACE" -o "$physical" \
+        -m comment --comment wireguard-portal -j ACCEPT 2>/dev/null; do
+        "$IPTABLES_BIN" -w -D ufw-user-forward -i "$HOST_IFACE" -o "$physical" \
+            -m comment --comment wireguard-portal -j ACCEPT || return 1
+    done
+    while "$IPTABLES_BIN" -w -C ufw-user-forward -i "$physical" -o "$HOST_IFACE" \
+        -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment wireguard-portal -j ACCEPT 2>/dev/null; do
+        "$IPTABLES_BIN" -w -D ufw-user-forward -i "$physical" -o "$HOST_IFACE" \
+            -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment wireguard-portal -j ACCEPT || return 1
+    done
+}
+
+allow_portal_through_ufw() {
+    local physical="$1"
+    [ -x "$IPTABLES_BIN" ] || return 0
+    "$IPTABLES_BIN" -w -nL ufw-user-forward >/dev/null 2>&1 || return 0
+
+    remove_ufw_portal_rules "$physical"
+    "$IPTABLES_BIN" -w -I ufw-user-forward 1 -i "$HOST_IFACE" -o "$physical" \
+        -m comment --comment wireguard-portal -j ACCEPT
+    if ! "$IPTABLES_BIN" -w -I ufw-user-forward 1 -i "$physical" -o "$HOST_IFACE" \
+        -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment wireguard-portal -j ACCEPT; then
+        remove_ufw_portal_rules "$physical" || true
+        return 1
+    fi
+    log "installed transient UFW forwarding exceptions for the isolated portal"
+}
+
 cleanup_namespace() {
     local profile_to_remove=""
     kill_browser
@@ -223,6 +260,13 @@ cleanup_namespace() {
         else
             log "physical interface $PHYSICAL_IFACE disappeared; no forwarding state remains to restore"
         fi
+    fi
+
+    # Remove the UFW interoperability rules before cutting the veth path. They
+    # are runtime-only and scoped to the fixed portal interface pair.
+    if ! remove_ufw_portal_rules "$PHYSICAL_IFACE"; then
+        log "CRITICAL: could not remove transient UFW portal forwarding exceptions"
+        return 1
     fi
 
     # Cut the veth path before removing any nftables gate. Even if a browser
@@ -395,6 +439,11 @@ setup_namespace() {
     nft "add chain $PORTAL_TABLE_FAMILY $PORTAL_TABLE_NAME portal_input { type filter hook input priority -10; policy accept; }"
     nft add rule "$PORTAL_TABLE_FAMILY" "$PORTAL_TABLE_NAME" portal_input \
         iifname "$HOST_IFACE" reject with icmp type admin-prohibited
+
+    # UFW may own a later forward hook with a drop policy. Add narrowly scoped,
+    # non-persistent exceptions so its policy does not block the isolated DNS
+    # and web traffic already constrained by the portal nftables rules.
+    allow_portal_through_ufw "$physical"
 
     log "isolated portal namespace ready on $physical"
 }
