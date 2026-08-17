@@ -84,8 +84,8 @@ normal VPN actions resume.
 | Tailscale | Optional, explicit opt-in | Existing rules are preserved; a tracked rule is added only when required |
 
 Core commands include `systemctl`, `ip`, `wg`, `wg-quick`, `curl`, `flock`,
-`nft`, and `pkexec`. Captive-portal support additionally requires `loginctl`,
-`iw`, `runuser`, `resolvectl`, `sysctl`, `setsid`, and a supported browser.
+`nft`, and `pkexec`. Portal support also requires `loginctl`, `iw`, `runuser`,
+`resolvectl`, `sysctl`, `setsid`, a browser, and optionally `iptables` for UFW.
 
 ## Files
 
@@ -191,9 +191,9 @@ make uninstall
 Uninstall refuses to proceed while portal cleanup is active or if it cannot
 safely remove the fail-closed guard.
 
-The Waybar module should execute `wireguard-status` and bind only middle-click
-to `wireguard-status toggle`. Leaving left- and right-click unbound prevents an
-accidental connect or disconnect:
+Bind only middle-click to `wireguard-status toggle`: green disconnects,
+disconnected connects, and yellow opens restart, portal-check, and intentional-
+disconnect choices. Leave left- and right-click unbound to prevent accidental use:
 
 ## Make commands
 
@@ -213,7 +213,7 @@ path:
 
 ```bash
 make status       # show the icon's current state
-make toggle       # same as middle-clicking the icon
+make toggle       # same context-sensitive action as middle-clicking the icon
 make disconnect   # explicit intentional disconnect
 make connect      # explicitly connect wg0
 make reconnect    # explicitly bounce and reconnect wg0

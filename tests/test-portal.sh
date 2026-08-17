@@ -44,6 +44,14 @@ grep -Fq 'hosts: files dns' "$REPO_DIR/wireguard-portal"
 grep -Fq -- '--user-data-dir="$PROFILE_DIR"' "$REPO_DIR/wireguard-portal"
 grep -Fq 'cleanup_namespace' "$REPO_DIR/wireguard-portal"
 grep -Fq 'hook input priority -10' "$REPO_DIR/wireguard-portal"
+# UFW owns a later forward hook on the supported desktop and must receive
+# transient, interface-scoped permits which are removed during every cleanup.
+# shellcheck disable=SC2016 # Assert literal production-script source text.
+grep -Fq 'allow_portal_through_ufw "$physical"' "$REPO_DIR/wireguard-portal"
+# shellcheck disable=SC2016 # Assert literal production-script source text.
+grep -Fq 'remove_ufw_portal_rules "$PHYSICAL_IFACE"' "$REPO_DIR/wireguard-portal"
+grep -Fq -- '--comment wireguard-portal' "$REPO_DIR/wireguard-portal"
+grep -Fq 'ufw-user-forward' "$REPO_DIR/wireguard-portal"
 # shellcheck disable=SC2016 # Assert literal production-script source text.
 grep -Fq 'iifname "$HOST_IFACE" reject' "$REPO_DIR/wireguard-portal"
 grep -Fq 'refresh_endpoint_cache' "$REPO_DIR/wireguard-portal"
