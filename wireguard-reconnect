@@ -368,6 +368,14 @@ fi
 remove_managed_tailscale_rules() {
     local pref
     if [ -r "$TAILSCALE_RULE_STATE" ]; then
+        pref="$(/usr/bin/awk -F= '$1 == "V4_MARK_PREF" {print $2; exit}' "$TAILSCALE_RULE_STATE" 2>/dev/null || true)"
+        if [[ "$pref" =~ ^[0-9]+$ ]]; then
+            /usr/bin/ip -4 rule del pref "$pref" fwmark 0x80000/0xff0000 lookup main 2>/dev/null || true
+        fi
+        pref="$(/usr/bin/awk -F= '$1 == "V6_MARK_PREF" {print $2; exit}' "$TAILSCALE_RULE_STATE" 2>/dev/null || true)"
+        if [[ "$pref" =~ ^[0-9]+$ ]]; then
+            /usr/bin/ip -6 rule del pref "$pref" fwmark 0x80000/0xff0000 lookup main 2>/dev/null || true
+        fi
         pref="$(/usr/bin/awk -F= '$1 == "V4_PREF" {print $2; exit}' "$TAILSCALE_RULE_STATE" 2>/dev/null || true)"
         if [[ "$pref" =~ ^[0-9]+$ ]]; then
             /usr/bin/ip -4 rule del pref "$pref" to 100.64.0.0/10 lookup 52 2>/dev/null || true
@@ -451,9 +459,35 @@ elif [ "$TAILSCALE_ENABLED" = "1" ] && [ -x /usr/bin/tailscale ] && \
         /usr/bin/ip -4 rule show | /usr/bin/awk '/not from all fwmark .* lookup 51820/ {sub(":", "", $1); print $1}'
     } | /usr/bin/sort -n | /usr/bin/head -n1)"
     [ -n "$wg_first_pref" ] || wg_first_pref=5185
-    tail_pref=$((wg_first_pref - 1))
+    tail_pref=$((wg_first_pref - 2))
+    mark_pref=$((wg_first_pref - 1))
     : >"$TAILSCALE_RULE_STATE"
     chmod 0600 "$TAILSCALE_RULE_STATE"
+
+    # Tailscale marks its encrypted control, DERP, and peer-underlay sockets.
+    # Put that mark ahead of wg-quick's full-tunnel rule so only those sockets
+    # use the normal uplink; unmarked public traffic still follows WireGuard.
+    if ! /usr/bin/ip -4 rule show | /usr/bin/awk -v limit="$wg_first_pref" '
+        /fwmark 0x80000\/0xff0000 .*lookup main/ {
+            pref=$1; sub(":", "", pref); if ((pref + 0) < limit) found=1
+        }
+        END {exit !found}
+    '; then
+        if /usr/bin/ip -4 rule add pref "$mark_pref" fwmark 0x80000/0xff0000 lookup main 2>/dev/null; then
+            printf 'V4_MARK_PREF=%s\n' "$mark_pref" >>"$TAILSCALE_RULE_STATE"
+        fi
+    fi
+
+    if ! /usr/bin/ip -6 rule show | /usr/bin/awk -v limit="$wg_first_pref" '
+        /fwmark 0x80000\/0xff0000 .*lookup main/ {
+            pref=$1; sub(":", "", pref); if ((pref + 0) < limit) found=1
+        }
+        END {exit !found}
+    '; then
+        if /usr/bin/ip -6 rule add pref "$mark_pref" fwmark 0x80000/0xff0000 lookup main 2>/dev/null; then
+            printf 'V6_MARK_PREF=%s\n' "$mark_pref" >>"$TAILSCALE_RULE_STATE"
+        fi
+    fi
 
     if ! /usr/bin/ip -4 rule show | /usr/bin/awk -v limit="$wg_first_pref" '
         /to 100\.64\.0\.0\/10 .*lookup 52/ {

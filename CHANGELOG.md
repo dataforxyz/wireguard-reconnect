@@ -17,6 +17,9 @@ All notable public changes are documented here. The project follows
 
 ### Changed
 
+- Fixed explicit Tailscale integration so marked control, DERP, and peer
+  transport sockets bypass WireGuard's full-tunnel policy while general DNS
+  and unmarked public traffic remain on WireGuard.
 - Refactored installer and uninstaller orchestration into named internal phases
   without introducing a shared privileged shell library.
 - Split detailed installer, Tailscale, captive-portal, and testing guidance into

@@ -19,8 +19,11 @@ There are two distinct behaviors:
    `ENABLE_TAILSCALE_INTEGRATION=1`, the installer records the choice and the
    reconnect helper first verifies that `tailscaled` is healthy and table 52
    has an active `tailscale0` route. If WireGuard's full-tunnel rules would win
-   first, it adds a root-owned, tracked destination rule immediately ahead of
-   them. Existing policy rules are never deleted or rewritten.
+   first, it adds root-owned, tracked rules immediately ahead of them: a mark
+   rule sends only Tailscale's encrypted transport sockets through the normal
+   uplink, and destination rules send tailnet traffic to table 52. Ordinary
+   public traffic and general DNS remain on WireGuard. Existing policy rules
+   are never deleted or rewritten.
 
 Enable or disable policy-rule repair by re-running the transactional installer.
 After the first explicit opt-in, later upgrades retain the recorded value when
@@ -53,6 +56,8 @@ ip -4 route show table 52
 ip -6 route show table 52
 ip -4 rule show | grep -E '100\.64\.0\.0/10|lookup 51820'
 ip -6 rule show | grep -E 'fd7a:115c:a1e0::/48|lookup 51820'
+ip -4 route get 192.0.2.1 mark 0x80000
+ip -6 route get 2001:db8::1 mark 0x80000
 ```
 
 On disable, uninstall, or failed-install rollback, only rules recorded in the

@@ -68,6 +68,14 @@ abort_uninstall() {
 remove_tracked_tailscale_rules() {
     local state=/run/wireguard-reconnect.tailscale-rules pref
     [ -r "$state" ] || return 0
+    pref="$(/usr/bin/awk -F= '$1 == "V4_MARK_PREF" {print $2; exit}' "$state" 2>/dev/null || true)"
+    if [[ "$pref" =~ ^[0-9]+$ ]]; then
+        /usr/bin/ip -4 rule del pref "$pref" fwmark 0x80000/0xff0000 lookup main 2>/dev/null || true
+    fi
+    pref="$(/usr/bin/awk -F= '$1 == "V6_MARK_PREF" {print $2; exit}' "$state" 2>/dev/null || true)"
+    if [[ "$pref" =~ ^[0-9]+$ ]]; then
+        /usr/bin/ip -6 rule del pref "$pref" fwmark 0x80000/0xff0000 lookup main 2>/dev/null || true
+    fi
     pref="$(/usr/bin/awk -F= '$1 == "V4_PREF" {print $2; exit}' "$state" 2>/dev/null || true)"
     if [[ "$pref" =~ ^[0-9]+$ ]]; then
         /usr/bin/ip -4 rule del pref "$pref" to 100.64.0.0/10 lookup 52 2>/dev/null || true
