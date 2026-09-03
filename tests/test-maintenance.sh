@@ -80,6 +80,22 @@ if grep -Fq 'tailscale up' wireguard-reconnect; then
   echo "Tailscale integration must not reconfigure the daemon" >&2
   exit 1
 fi
+# Tailscale transport bypass must precede wg-quick and remain project-tracked
+# so disabling, rollback, and uninstall remove only rules created here.
+grep -Fq 'V4_MARK_PREF=' wireguard-reconnect
+grep -Fq 'V6_MARK_PREF=' wireguard-reconnect
+grep -Fq 'fwmark 0x80000/0xff0000 lookup main' wireguard-reconnect
+grep -Fq 'V4_MARK_PREF' install.sh
+grep -Fq 'V6_MARK_PREF' install.sh
+grep -Fq 'V4_MARK_PREF' uninstall.sh
+grep -Fq 'V6_MARK_PREF' uninstall.sh
+# Destination rules must run before the broader mark rule; otherwise marked
+# tailnet packets would follow the physical default route instead of table 52.
+# shellcheck disable=SC2016 # Assert literal production-script source text.
+tail_line="$(grep -n 'tail_pref=$((wg_first_pref - 2))' wireguard-reconnect | cut -d: -f1)"
+# shellcheck disable=SC2016 # Assert literal production-script source text.
+mark_line="$(grep -n 'mark_pref=$((wg_first_pref - 1))' wireguard-reconnect | cut -d: -f1)"
+[[ "$tail_line" =~ ^[0-9]+$ && "$mark_line" =~ ^[0-9]+$ && "$tail_line" -lt "$mark_line" ]]
 
 # Every optional feature remains explicit, persisted, and documented. Optional
 # units must not pull disabled companions back in through Wants= dependencies.

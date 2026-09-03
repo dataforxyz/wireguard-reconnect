@@ -294,7 +294,7 @@ fi
 if [ "$TEST_MODE" = tailscale-optout ]; then
   printf '1\n' >/etc/wireguard-reconnect/tailscale-enabled
   printf 'WIREGUARD_INTERFACE=wg0\nWIREGUARD_TAILSCALE_ENABLED=1\n' >/etc/wireguard-reconnect/environment
-  printf 'V4_PREF=5200\n' >/run/wireguard-reconnect.tailscale-rules
+  printf 'V4_MARK_PREF=5199\nV6_MARK_PREF=5199\nV4_PREF=5200\n' >/run/wireguard-reconnect.tailscale-rules
   chmod 0600 /run/wireguard-reconnect.tailscale-rules
 fi
 
@@ -433,6 +433,8 @@ case "$TEST_MODE" in
     [ "$rc" -eq 0 ]
     [ -e "$MOCK_STATE/link-wg0" ]
     [ ! -e /run/wireguard-reconnect.tailscale-rules ]
+    grep -Fq -- '-4 rule del pref 5199 fwmark 0x80000/0xff0000 lookup main' "$MOCK_STATE/ip-calls"
+    grep -Fq -- '-6 rule del pref 5199 fwmark 0x80000/0xff0000 lookup main' "$MOCK_STATE/ip-calls"
     grep -Fq -- '-4 rule del pref 5200 to 100.64.0.0/10 lookup 52' "$MOCK_STATE/ip-calls"
     grep -Fxq '0' /etc/wireguard-reconnect/tailscale-enabled
     ;;
