@@ -17,12 +17,15 @@ There are two distinct behaviors:
    preferences.
 2. **Policy-rule repair is explicit opt-in.** With
    `ENABLE_TAILSCALE_INTEGRATION=1`, the installer records the choice and the
-   reconnect helper first verifies that `tailscaled` is healthy and table 52
-   has an active `tailscale0` route. If WireGuard's full-tunnel rules would win
-   first, it adds root-owned, tracked rules immediately ahead of them: a mark
+   reconnect helper installs the rules even while `tailscaled` is starting,
+   so its control connection can complete before tailnet routes arrive.
+   If WireGuard's full-tunnel rules would win first, it adds root-owned,
+   tracked rules immediately ahead of them: a mark
    rule sends only Tailscale's encrypted transport sockets through the normal
    uplink, and destination rules send tailnet traffic to table 52. Ordinary
-   public traffic and general DNS remain on WireGuard. Existing policy rules
+   public traffic and general DNS remain on WireGuard. Empty table-52 lookups
+   fall through to the existing routing policy; routes received after login
+   become usable without another WireGuard reconnect. Existing policy rules
    are never deleted or rewritten.
 
 Enable or disable policy-rule repair by re-running the transactional installer.

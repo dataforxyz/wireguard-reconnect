@@ -17,6 +17,8 @@ All notable public changes are documented here. The project follows
 
 ### Changed
 
+- Fixed Tailscale startup routing so opt-in transport and tailnet rules are
+  installed before daemon login and remain ready for routes arriving later.
 - Fixed explicit Tailscale integration so marked control, DERP, and peer
   transport sockets bypass WireGuard's full-tunnel policy while general DNS
   and unmarked public traffic remain on WireGuard.

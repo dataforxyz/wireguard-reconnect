@@ -448,9 +448,11 @@ esac
 # exists, and remove only that tracked rule on down/uninstall.
 if [ "$ACTION" = "down" ]; then
     remove_managed_tailscale_rules
-elif [ "$TAILSCALE_ENABLED" = "1" ] && [ -x /usr/bin/tailscale ] && \
-   /usr/bin/tailscale status >/dev/null 2>&1 && \
-   /usr/bin/ip -4 route show table 52 | /usr/bin/grep -q 'dev tailscale0'; then
+elif [ "$TAILSCALE_ENABLED" = "1" ] && [ -x /usr/bin/tailscale ]; then
+    # Install the opt-in rules even while tailscaled is starting. Its control
+    # connection needs the marked uplink exception before login can succeed,
+    # and table-52 routes may arrive after this action has finished. An empty
+    # table lookup falls through to the existing rules until routes appear.
     /usr/bin/resolvectl flush-caches 2>/dev/null || true
     remove_managed_tailscale_rules
 
@@ -500,8 +502,7 @@ elif [ "$TAILSCALE_ENABLED" = "1" ] && [ -x /usr/bin/tailscale ] && \
         fi
     fi
 
-    if /usr/bin/ip -6 route show table 52 | /usr/bin/grep -q 'dev tailscale0' && \
-       ! /usr/bin/ip -6 rule show | /usr/bin/awk -v limit="$wg_first_pref" '
+    if ! /usr/bin/ip -6 rule show | /usr/bin/awk -v limit="$wg_first_pref" '
             /to fd7a:115c:a1e0::\/48 .*lookup 52/ {
                 pref=$1; sub(":", "", pref); if ((pref + 0) < limit) found=1
             }
@@ -514,7 +515,7 @@ elif [ "$TAILSCALE_ENABLED" = "1" ] && [ -x /usr/bin/tailscale ] && \
     [ -s "$TAILSCALE_RULE_STATE" ] || rm -f "$TAILSCALE_RULE_STATE"
     echo "[#] refreshed opt-in Tailscale route priority without modifying pre-existing rules" >>"$LOG_FILE"
 elif [ "$TAILSCALE_ENABLED" = "1" ]; then
-    echo "[#] Tailscale integration enabled but active table-52 routes were not verified; left unchanged" >>"$LOG_FILE"
+    echo "[#] Tailscale integration enabled but its executable is unavailable; left unchanged" >>"$LOG_FILE"
 fi
 
 # Refresh and verify again after wg-quick has installed its final fwmark/routes.
