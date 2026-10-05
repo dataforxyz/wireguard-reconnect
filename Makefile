@@ -142,6 +142,7 @@ test:
 	@./tests/test-killswitch.sh
 	@./tests/test-autostart.sh
 	@./tests/test-monitor-intent.sh
+	@./tests/test-tailscale-netns.sh
 	@./tests/test-status.sh
 	@./tests/test-make-controls.sh
 	@./tests/test-portal.sh

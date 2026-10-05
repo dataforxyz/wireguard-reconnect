@@ -13,6 +13,8 @@ The suite covers:
 - nftables policy-drop generation, emergency fallback, endpoint provenance,
   deletion/query failures, and rollback timers;
 - boot autostart idempotency and separation of monitor repair from boot connection intent;
+- Tailscale startup routing with an unavailable daemon and delayed tailnet
+  routes, using real kernel policy routing in a disposable network namespace;
 - status/Waybar middle-click safety;
 - Make control dispatch;
 - portal orchestration, probe classification, active-session restrictions,
