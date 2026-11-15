@@ -35,10 +35,11 @@ cat >"$TMP/bin/notify-send" <<'EOF'
 exit 0
 EOF
 
-cat >"$TMP/bin/walker" <<'EOF'
+cat >"$TMP/bin/omarchy-menu-select" <<'EOF'
 #!/bin/bash
-cat >"$STATUS_MENU_LOG"
+printf '%s\n' "$@" >"$STATUS_MENU_LOG"
 printf '%s\n' "${STATUS_MENU_SELECTION:-}"
+exit "${STATUS_MENU_EXIT:-0}"
 EOF
 
 chmod +x "$TMP/bin/"*
@@ -78,6 +79,11 @@ grep -Fxq "$TMP/bin/helper portal wg0" "$STATUS_CALL_LOG"
 : >"$STATUS_CALL_LOG"
 STATUS_MENU_SELECTION='Disconnect and disable leak protection' "$REPO_DIR/wireguard-status" toggle
 grep -Fxq "$TMP/bin/helper down wg0" "$STATUS_CALL_LOG"
+# Closing the picker must never issue a privileged recovery command.
+: >"$STATUS_CALL_LOG"
+STATUS_MENU_EXIT=1 "$REPO_DIR/wireguard-status" toggle
+test ! -s "$STATUS_CALL_LOG"
+
 rm -f "$WIREGUARD_INTENT_STATE"
 
 touch "$WIREGUARD_PORTAL_STATE"

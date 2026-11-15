@@ -348,3 +348,12 @@ version 3 or any later version (`GPL-3.0-or-later`). See [`LICENSE`](LICENSE).
 The project invokes system utilities such as WireGuard, nftables, systemd,
 Chromium-family browsers, and optional Tailscale as separate programs; those
 programs retain their own licenses.
+
+### Omarchy Quattro status icon
+
+The status helper’s recovery menu uses `omarchy-menu-select`, with Zenity as
+a fallback. Cancelling leaves the connection and leak protection unchanged.
+The personal Quattro shell can call this same JSON status helper; its bar
+layout and middle-click binding are saved separately in the private desktop
+configuration repository. This menu port does not change VPN routes, keys,
+kill-switch rules or Tailscale settings.
