@@ -207,11 +207,10 @@ recovery_menu() {
     [ "$PORTAL_ENABLED" = "1" ] && options+=('Check captive portal')
     options+=('Disconnect and disable leak protection')
 
-    if command -v walker >/dev/null 2>&1; then
-        if ! selection="$(printf '%s\n' "${options[@]}" | \
-            walker --dmenu --selectsingle --placeholder "$RECOVERY_MENU_TITLE" 2>/dev/null)"; then
+    if command -v omarchy-menu-select >/dev/null 2>&1; then
+        if ! selection="$(omarchy-menu-select "$RECOVERY_MENU_TITLE" "${options[@]}" 2>/dev/null)"; then
             notify -u normal "VPN recovery menu closed" \
-                "Walker did not return a selection. Use wireguard-status reconnect, portal, or disconnect."
+                "The menu did not return a selection. Use wireguard-status reconnect, portal, or disconnect."
             return 0
         fi
     elif command -v zenity >/dev/null 2>&1; then
@@ -219,7 +218,7 @@ recovery_menu() {
             "${options[@]}" 2>/dev/null || true)"
     else
         notify -u critical "VPN recovery menu unavailable" \
-            "Install walker or zenity, then use wireguard-status reconnect, portal, or disconnect."
+            "Install the Omarchy menu or zenity, then use wireguard-status reconnect, portal, or disconnect."
         return 0
     fi
 
