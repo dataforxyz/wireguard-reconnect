@@ -16,7 +16,7 @@ automatic or policy-enforcement component can be disabled explicitly:
 | Installer option | Default | Effect when `0` |
 |---|---:|---|
 | `ENABLE_KILLSWITCH` | `1` | Do not arm nftables or enable the early-boot guard. Any existing project guard is removed transactionally. |
-| `ENABLE_AUTOMATIC_RECONNECT` | `1` | Disable the network monitor, suspend/wake repair, guard watchdog, and Waybar-initiated automatic reconnect. Manual controls still work. |
+| `ENABLE_AUTOMATIC_RECONNECT` | `1` | Disable the network monitor, suspend/wake repair, guard watchdog, and status-widget-initiated automatic reconnect. Manual controls still work. |
 | `ENABLE_AUTOSTART` | `1` | Do not mark/connect WireGuard automatically at the next boot. |
 | `ENABLE_CAPTIVE_PORTAL` | `1` | Disable both manual and automatic isolated captive-portal handling. |
 | `ENABLE_AUTO_PORTAL` | `1` | Keep manual portal handling but disable automatic Wi-Fi portal detection. |
@@ -75,7 +75,7 @@ reconnect is disabled. Tailscale details are in
 The installer always installs the fixed helpers, user status command, selected
 interface authorization, systemd units, and narrow polkit rule. It records all
 selected options in root-only files under `/etc/wireguard-reconnect/`; nonsecret
-Waybar-facing flags are also stored under
+status-widget-facing flags are also stored under
 `/usr/local/share/wireguard-reconnect/`.
 
 It then performs only the selected runtime actions: guard pre-arm/removal,
@@ -92,7 +92,7 @@ automatically restored or deleted afterward.
 ## Transaction boundaries
 
 The transaction holds exclusive install, reconnect, and portal locks while
-helpers and firewall state are changing. This prevents Waybar, monitor,
+helpers and firewall state are changing. This prevents status-widget, monitor,
 suspend, and portal actions from observing a partially replaced installation.
 
 When the kill switch is selected, a fresh install arms a 90-second recovery
@@ -110,7 +110,7 @@ If boot connection is enabled while the general monitor is disabled, the
 bounded autostart unit asks systemd to retry after a late underlay instead of
 silently abandoning the requested boot connection. An intentional disconnect
 or `CONNECT_ON_INSTALL=0` writes a same-boot suppression marker, so queued
-monitor/Waybar actions and autostart retries cannot undo that choice; `/run`
+monitor/status-widget actions and autostart retries cannot undo that choice; `/run`
 clears the marker for the next boot.
 
 ## Interface migration
@@ -160,3 +160,13 @@ sudo RESTORE_BACKUP_DIR=/var/backups/wireguard-reconnect-YYYYMMDD-HHMMSS ./unins
 If disconnect or guard removal fails, uninstall releases its locks, restores
 previously active automatic services, and retains the helpers needed for
 recovery.
+
+## Quattro desktop and NetworkManager
+
+See the [Quattro guide](omarchy-quattro.md) before integrating the status icon
+or migrating from iwd/networkd. The installer installs the JSON status helper;
+it does not rewrite Omarchy shell layout, migrate Wi-Fi profiles, or switch
+network managers. The shipped units still name the older network services in
+`After=`; the guide documents additional NetworkManager ordering used by the
+migrated workstation. Desktop migration and privileged network installation
+are separate operations.

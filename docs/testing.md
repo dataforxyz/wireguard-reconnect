@@ -15,7 +15,7 @@ The suite covers:
 - boot autostart idempotency and separation of monitor repair from boot connection intent;
 - Tailscale startup routing with an unavailable daemon and delayed tailnet
   routes, using real kernel policy routing in a disposable network namespace;
-- status/Waybar middle-click safety;
+- status-widget recovery/cancellation and middle-click safety;
 - Make control dispatch;
 - portal orchestration, probe classification, active-session restrictions,
   cooldowns, and concurrency;
@@ -82,3 +82,25 @@ user-writable or separately versioned shell library sourced by root helpers just
 to reduce repeated constants: that would widen the replacement and
 version-skew attack surface. Prefer small internal functions, fixed-action
 root-owned helpers, and tests that assert contracts across standalone scripts.
+
+## Configuration overrides
+
+Environment variables may be supplied through systemd service drop-ins:
+
+The authorized interface, feature policy, and Tailscale integration are persisted
+install-time settings; re-run the installer to change them. Runtime service drop-ins may adjust:
+
+- `WIREGUARD_MONITOR_DEBOUNCE=5`
+- `WIREGUARD_MONITOR_STABILIZE_DELAY=2`
+- `WIREGUARD_AUTO_PORTAL=1`
+- `WIREGUARD_PORTAL_COOLDOWN=300`
+- `WIREGUARD_PORTAL_GLOBAL_COOLDOWN=30`
+- `WIREGUARD_PORTAL_SCAN_INTERVAL=60`
+- `WIREGUARD_PORTAL_USER_FILE=/etc/wireguard-reconnect/portal-user`
+- `WIREGUARD_STARTUP_WAIT=30`
+- `WIREGUARD_CHECK_URL=http://connectivitycheck.gstatic.com/generate_204`
+- `WIREGUARD_CHECK_TIMEOUT=4`
+- `WG_KILLSWITCH_LOG_MAX_BYTES=262144`
+- `WG_KILLSWITCH_LOG_KEEP_LINES=1000`
+- `WIREGUARD_PORTAL_CHECK_URL_PRIMARY=http://connectivitycheck.gstatic.com/generate_204`
+- `WIREGUARD_PORTAL_CHECK_URL_SECONDARY=http://cp.cloudflare.com/generate_204`

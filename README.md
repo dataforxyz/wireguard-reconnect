@@ -1,7 +1,7 @@
 # wireguard-reconnect
 
-WireGuard controls and optional recovery automation for a Linux laptop using
-iwd/systemd-networkd, with Waybar integration, an opt-out full-tunnel kill
+WireGuard controls and optional recovery automation for a systemd Linux laptop,
+with Omarchy Quattro/native-menu and optional Waybar integration, an opt-out full-tunnel kill
 switch, opt-out reconnect/boot/portal automation, and opt-in Tailscale repair.
 
 Current release: **v1.3.0-beta.1**
@@ -27,7 +27,7 @@ connection are independently selectable; see [Install](#install).
 - **After suspend/resume:** restarts the network monitor, waits for Wi-Fi, tests
   real traffic through `wg0`, and reconnects only when stale.
 - **After Wi-Fi/AP/network changes:** reacts to netlink route/link/address events
-  instead of waiting for Waybar's polling threshold.
+  instead of waiting for the status widget’s polling threshold.
 - **After an intentional disconnect:** leaves WireGuard off for the rest of that
   boot. The next system boot enables it again by default.
 - **With opt-in Tailscale integration:** preserves pre-existing table-52 rules
@@ -77,8 +77,8 @@ normal VPN actions resume.
 | Init/service manager | systemd | Required by installer and sleep hook |
 | Firewall | nftables | iptables-only systems are not supported |
 | WireGuard | `wg-quick`, full-tunnel `wg0` | Interface may be overridden |
-| Wi-Fi/network stack | IPv4 underlay with iwd + systemd-networkd | Other netlink-compatible stacks and IPv6-only underlays are untested |
-| Desktop | Wayland + Waybar | CLI controls work without Waybar; automatic browser launch requires an active local Wayland session |
+| Wi-Fi/network stack | IPv4 underlay; legacy iwd/networkd and a migrated NetworkManager workstation | Quattro ordering notes and remaining acceptance limits: [desktop guide](docs/omarchy-quattro.md). IPv6-only underlays are untested |
+| Desktop | Wayland; Quattro native picker or Zenity | Optional JSON status integration works with Quattro custom widgets or Waybar. Installer does not create a Quattro widget |
 | Browser | Chromium, Brave, or Google Chrome | Required only when captive-portal support is enabled; Firefox is not currently supported by portal isolation |
 | Distribution | Arch Linux / Omarchy | Other systemd distributions require dependency/path validation |
 | Tailscale | Optional, explicit opt-in | Existing rules are preserved; a tracked rule is added only when required |
@@ -92,7 +92,7 @@ Core commands include `systemctl`, `ip`, `wg`, `wg-quick`, `curl`, `flock`,
 - `wireguard-reconnect` — root-owned, fixed-action helper used through `pkexec`
 - `wireguard-portal` — isolated captive-portal namespace/browser orchestrator
 - `wg-killswitch` — nftables full-tunnel kill switch
-- `wireguard-status` — Waybar JSON status/toggle/autoreconnect command
+- `wireguard-status` — JSON status/toggle/autoreconnect command
 - `wireguard-monitor` — event-driven physical-network monitor
 - `wireguard-autostart` — enables WireGuard by default on each boot
 - `wireguard-reconnect-sleep` — restarts the monitor after resume
@@ -101,6 +101,8 @@ Core commands include `systemctl`, `ip`, `wg`, `wg-quick`, `curl`, `flock`,
 - `wireguard-killswitch.service` — early-boot fail-closed nftables guard
 
 ## Operator documentation
+
+- [Quattro setup, status icon, and pre-Quattro archive](docs/omarchy-quattro.md)
 
 - [Installer and rollback model](docs/installer.md)
 - [Tailscale integration and bypass scope](docs/tailscale.md)
@@ -198,18 +200,12 @@ disconnect choices. Leave left- and right-click unbound to prevent accidental us
 ## Make commands
 
 Run `make` or `make help` in this repository to list the available controls.
-The common commands mirror the Waybar icon and provide an explicit recovery
+The common commands mirror the status icon and provide an explicit recovery
 path:
 
-```jsonc
-"custom/wireguard": {
-  "exec": "wireguard-status",
-  "return-type": "json",
-  "interval": 10,
-  "signal": 10,
-  "on-click-middle": "wireguard-status toggle"
-}
-```
+For Quattro widget and legacy Waybar examples, see the
+[desktop integration guide](docs/omarchy-quattro.md#status-icon).
+
 
 ```bash
 make status       # show the icon's current state
@@ -281,27 +277,8 @@ Release checklist:
 6. publish matching GitHub release notes; and
 7. verify the public CI workflow.
 
-## Configuration overrides
-
-Environment variables may be supplied through systemd service drop-ins:
-
-The authorized interface, feature policy, and Tailscale integration are persisted
-install-time settings; re-run the installer to change them. Runtime service drop-ins may adjust:
-
-- `WIREGUARD_MONITOR_DEBOUNCE=5`
-- `WIREGUARD_MONITOR_STABILIZE_DELAY=2`
-- `WIREGUARD_AUTO_PORTAL=1`
-- `WIREGUARD_PORTAL_COOLDOWN=300`
-- `WIREGUARD_PORTAL_GLOBAL_COOLDOWN=30`
-- `WIREGUARD_PORTAL_SCAN_INTERVAL=60`
-- `WIREGUARD_PORTAL_USER_FILE=/etc/wireguard-reconnect/portal-user`
-- `WIREGUARD_STARTUP_WAIT=30`
-- `WIREGUARD_CHECK_URL=http://connectivitycheck.gstatic.com/generate_204`
-- `WIREGUARD_CHECK_TIMEOUT=4`
-- `WG_KILLSWITCH_LOG_MAX_BYTES=262144`
-- `WG_KILLSWITCH_LOG_KEEP_LINES=1000`
-- `WIREGUARD_PORTAL_CHECK_URL_PRIMARY=http://connectivitycheck.gstatic.com/generate_204`
-- `WIREGUARD_PORTAL_CHECK_URL_SECONDARY=http://cp.cloudflare.com/generate_204`
+Runtime options and service drop-ins are documented under
+[Configuration overrides](docs/testing.md#configuration-overrides).
 
 ## Performance, diagnostics, and tests
 
@@ -348,12 +325,3 @@ version 3 or any later version (`GPL-3.0-or-later`). See [`LICENSE`](LICENSE).
 The project invokes system utilities such as WireGuard, nftables, systemd,
 Chromium-family browsers, and optional Tailscale as separate programs; those
 programs retain their own licenses.
-
-### Omarchy Quattro status icon
-
-The status helper’s recovery menu uses `omarchy-menu-select`, with Zenity as
-a fallback. Cancelling leaves the connection and leak protection unchanged.
-The personal Quattro shell can call this same JSON status helper; its bar
-layout and middle-click binding are saved separately in the private desktop
-configuration repository. This menu port does not change VPN routes, keys,
-kill-switch rules or Tailscale settings.
